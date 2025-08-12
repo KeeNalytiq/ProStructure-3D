@@ -1,17 +1,65 @@
-# 🎈 ESMFold
+# ProStructure - 3D
 
-[*ESMFold*](https://esmatlas.com/about) is an end-to-end single sequence protein structure predictor based on the ESM-2 language model.
+This Streamlit app predicts and visualizes protein structures, providing key analytical insights such as structural quality, residue composition, hydrophobicity, and other metrics.
 
-## Demo App
+## Features
 
-[![Streamlit App](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=Streamlit&logoColor=white)](https://esmfold.streamlit.app/)
+* **Interactive 3D Structure Viewer** powered by `py3Dmol` and `stmol`.
+* **Quick Statistics Panel** including:
 
-## Credit
+  * Sequence length
+  * Molecular weight
+  * Estimated isoelectric point (pI)
+  * Percentage of residues with high pLDDT confidence scores
+  * Solvent Accessible Surface Area (SASA)
+  * Disulfide bond count
+  * Secondary structure breakdown (helix, sheet, coil)
+* **Per-residue Analysis** with hydrophobicity and pLDDT plots.
+* **Charge & Composition** visualization with charts.
+* **Modern UI** with styled containers and responsive layout.
 
-This app was inspired by [osanseviero's app](https://huggingface.co/spaces/osanseviero/esmfold).
+## Requirements
 
-## Further Reading
-For more information, read the following articles:
-- [ESM Metagenomic Atlas: The first view of the ‘dark matter’ of the protein universe](https://ai.facebook.com/blog/protein-folding-esmfold-metagenomics/)
-- [Evolutionary-scale prediction of atomic level protein structure with a language model](https://www.biorxiv.org/content/10.1101/2022.07.20.500902v2)
-- [AlphaFold’s new rival? Meta AI predicts shape of 600 million proteins](https://www.nature.com/articles/d41586-022-03539-1)
+Install dependencies from `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+Run the app locally:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+## File Inputs
+
+* The app uses a PDB file (`predicted.pdb`) as input.
+* Future updates will support uploading sequences in FASTA format for on-the-fly prediction.
+
+## UI Layout
+
+* **3D Structure**: Left panel with large interactive model.
+* **Quick Statistics**: Right panel with structural and sequence data.
+* **Charge & Composition**: Visual charts showing residue type distribution and charge.
+* **Per-residue Analyses**: Detailed plDDT and hydrophobicity plots.
+
+## Customization
+
+You can adjust:
+
+* Background colors and styles in the CSS section.
+* Default coloring scheme for 3D models (`spectrum`, `chain`, `b-factor`, etc.).
+
+## Planned Enhancements
+
+* Automated molecular weight and pI calculation.
+* Dynamic pocket and ligand-binding site detection.
+* Mutation effect prediction.
+
+---
+
+**Author:** Keeistu M S
+**License:** MIT
