@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: prostuct-3d
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run streamlit_app.py --server.port=$PORT --server.address=0.0.0.0
+    envVars:
+      - key: STREAMLIT_SERVER_PORT
+        value: $PORT
+      - key: STREAMLIT_SERVER_ADDRESS
+        value: 0.0.0.0
