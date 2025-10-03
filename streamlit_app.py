@@ -350,12 +350,39 @@ NEGATIVE_AA = set(['D', 'E'])
 
 
 def clean_sequence(seq: str) -> str:
+    """Clean and validate protein sequence, keeping all valid amino acids."""
+    if not seq:
+        return ""
+    
     seq = seq.upper()
     
+    # Remove common non-amino acid characters
     seq = re.sub(r"[^A-Z]", "", seq)
-    # keep only standard 20 amino acids
-    seq = ''.join([s for s in seq if s in AA_LIST])
-    return seq
+    
+    # Keep all valid amino acids (including non-standard ones)
+    valid_aa = "ACDEFGHIKLMNPQRSTVWY" + "BJOUXZ"  # Standard + non-standard
+    cleaned_seq = ''.join([s for s in seq if s in valid_aa])
+    
+    return cleaned_seq
+
+
+def validate_sequence(seq: str) -> tuple[bool, str]:
+    """Validate sequence and return (is_valid, error_message)."""
+    if not seq:
+        return False, "Empty sequence"
+    
+    if len(seq) < 5:
+        return False, f"Sequence too short ({len(seq)} residues). Minimum 5 residues required."
+    
+    if len(seq) > 2000:
+        return False, f"Sequence too long ({len(seq)} residues). Maximum 2000 residues supported."
+    
+    # Check for valid amino acids
+    invalid_chars = set(seq) - set("ACDEFGHIKLMNPQRSTVWYBJOUXZ")
+    if invalid_chars:
+        return False, f"Invalid characters found: {', '.join(sorted(invalid_chars))}"
+    
+    return True, ""
 
 
 def parse_fasta(text: str) -> str:
@@ -367,8 +394,8 @@ def parse_fasta(text: str) -> str:
     return clean_sequence(''.join(lines))
 
 
-def predict_pdb_with_retry(sequence: str, max_retries: int = 3, base_delay: float = 1.0):
-    """Predict PDB with retry mechanism and multiple API endpoints."""
+def predict_pdb_with_retry(sequence: str, max_retries: int = 5, base_delay: float = 2.0):
+    """Predict PDB with enhanced retry logic and better error handling."""
     
     # List of API endpoints to try
     api_endpoints = [
@@ -377,48 +404,84 @@ def predict_pdb_with_retry(sequence: str, max_retries: int = 3, base_delay: floa
         'https://api.esmatlas.com/foldSequence/v1/pdb'
     ]
     
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'ProStruct-3D/1.0',
+        'Accept': 'text/plain, application/json'
+    }
+    
+    # Adjust timeout based on sequence length
+    timeout = min(300, max(60, len(sequence) * 0.5))
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
     
     for attempt in range(max_retries):
-        for endpoint in api_endpoints:
+        status_text.text(f"🔄 Attempt {attempt + 1}/{max_retries}")
+        progress_bar.progress((attempt + 1) / max_retries)
+        
+        for i, endpoint in enumerate(api_endpoints):
             try:
+                status_text.text(f"🌐 Trying endpoint {i + 1}/{len(api_endpoints)}")
+                
                 # Add jitter to prevent thundering herd
-                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                if attempt > 0:
-                    st.info(f"Retry attempt {attempt + 1}/{max_retries} after {delay:.1f}s delay...")
+                delay = base_delay * (1.5 ** attempt) + random.uniform(0, 1)
+                if attempt > 0 or i > 0:
                     time.sleep(delay)
                 
-                response = requests.post(endpoint, headers=headers, data=sequence, timeout=120)
+                response = requests.post(endpoint, headers=headers, data=sequence, timeout=timeout)
                 
                 if response.status_code == 200:
                     content = response.content.decode('utf-8')
                     # Validate that we got PDB content, not an HTML error page
                     if content.strip().startswith('ATOM') or content.strip().startswith('HEADER'):
+                        progress_bar.empty()
+                        status_text.empty()
+                        st.success("🎉 Structure prediction successful!")
                         return content
                     else:
-                        st.warning(f"API returned non-PDB content from {endpoint}. Trying next endpoint...")
+                        st.warning(f"⚠️ Endpoint {i + 1} returned non-PDB content. Trying next...")
                         continue
+                        
                 elif response.status_code == 503:
-                    st.warning(f"Service temporarily unavailable (503) from {endpoint}. Trying next endpoint...")
+                    st.warning(f"🔧 Service unavailable (503) from endpoint {i + 1}. Trying next...")
                     continue
+                    
                 elif response.status_code == 429:
-                    st.warning(f"Rate limited (429) from {endpoint}. Waiting longer...")
+                    st.warning(f"⏳ Rate limited (429) from endpoint {i + 1}. Waiting {delay * 2:.1f}s...")
                     time.sleep(delay * 2)
                     continue
+                    
+                elif response.status_code == 400:
+                    st.error(f"❌ Bad request (400) from endpoint {i + 1}. Check your sequence.")
+                    continue
+                    
+                elif response.status_code == 413:
+                    st.error(f"❌ Sequence too long (413) for endpoint {i + 1}. Try a shorter sequence.")
+                    continue
+                    
                 else:
-                    st.warning(f"API returned status {response.status_code} from {endpoint}. Trying next endpoint...")
+                    st.warning(f"⚠️ Endpoint {i + 1} returned status {response.status_code}. Trying next...")
                     continue
                     
             except requests.exceptions.Timeout:
-                st.warning(f"Timeout from {endpoint}. Trying next endpoint...")
+                st.warning(f"⏱️ Timeout from endpoint {i + 1} (>{timeout}s). Trying next...")
                 continue
+                
             except requests.exceptions.ConnectionError:
-                st.warning(f"Connection error from {endpoint}. Trying next endpoint...")
+                st.warning(f"🔌 Connection error from endpoint {i + 1}. Trying next...")
                 continue
+                
+            except requests.exceptions.RequestException as e:
+                st.warning(f"🌐 Network error from endpoint {i + 1}: {str(e)[:100]}...")
+                continue
+                
             except Exception as e:
-                st.warning(f"Error from {endpoint}: {e}. Trying next endpoint...")
+                st.warning(f"❓ Unexpected error from endpoint {i + 1}: {str(e)[:100]}...")
                 continue
     
+    progress_bar.empty()
+    status_text.empty()
     return None
 
 
@@ -1104,7 +1167,8 @@ with st.sidebar:
     # Global settings
     color_mode = st.selectbox("3D Color Mode", ['spectrum', 'chain', 'plddt', 'hydrophobicity'])
     surface_toggle = st.checkbox("Show molecular surface", value=False)
-    minimum_length = st.number_input("Min sequence length", min_value=10, max_value=5000, value=20)
+    minimum_length = st.number_input("Min sequence length", min_value=5, max_value=5000, value=5, 
+                                     help="Minimum sequence length for prediction (default: 5 residues)")
     
     # Prediction method selection
     prediction_method = st.selectbox(
@@ -1168,16 +1232,35 @@ with tab1:
         sequence = st.session_state.sample_sequence
         st.info(f"Loaded sample sequence: {len(sequence)} residues")
     
-    if len(sequence) == 0:
-        st.info("👆 Please paste a protein sequence or upload a FASTA file to get started.")
+    # Validate sequence
+    is_valid, error_msg = validate_sequence(sequence)
+    
+    if not is_valid:
+        st.error(f"❌ **Sequence validation failed:** {error_msg}")
+        st.markdown("""
+        **Tips for valid sequences:**
+        - Use standard amino acid codes: ACDEFGHIKLMNPQRSTVWY
+        - Non-standard codes also accepted: BJOUXZ
+        - Minimum length: 5 residues
+        - Maximum length: 2000 residues
+        - Remove any numbers, spaces, or special characters
+        """)
         st.stop()
     
     if len(sequence) < minimum_length:
-        st.error(f"Sequence length {len(sequence)} is shorter than required minimum of {minimum_length}.")
+        st.warning(f"⚠️ Sequence length {len(sequence)} is shorter than your minimum setting of {minimum_length}.")
+        st.info("💡 You can lower the minimum length in the sidebar if needed.")
         st.stop()
     
     # Display sequence info
     st.success(f"✅ Sequence loaded: {len(sequence)} residues")
+    
+    # Show sequence composition
+    aa_counts = {aa: sequence.count(aa) for aa in set(sequence)}
+    non_standard = [aa for aa in aa_counts.keys() if aa not in "ACDEFGHIKLMNPQRSTVWY"]
+    
+    if non_standard:
+        st.info(f"ℹ️ Non-standard amino acids detected: {', '.join(non_standard)}")
     
     # Prediction button
     if st.button('🚀 Predict & Analyze Structure', type="primary", use_container_width=True):
@@ -1193,12 +1276,24 @@ with tab1:
             pdb_text = predict_pdb_from_esmfold(sequence, method="local" if use_local else "api")
             if pdb_text is None:
                 st.error("❌ **Prediction failed** — All API endpoints are currently unavailable.")
+                
+                # Show sequence info for debugging
+                with st.expander("🔍 Debug Information"):
+                    st.markdown(f"""
+                    **Sequence Details:**
+                    - Length: {len(sequence)} residues
+                    - Composition: {', '.join(f'{aa}: {sequence.count(aa)}' for aa in sorted(set(sequence)))}
+                    - Validation: {'✅ Valid' if validate_sequence(sequence)[0] else '❌ Invalid'}
+                    - Method: {method_name}
+                    """)
+                
                 st.markdown("""
                 **Possible solutions:**
                 1. **Wait and retry** - The ESM Atlas API may be temporarily overloaded
-                2. **Try a shorter sequence** - Long sequences may timeout
+                2. **Try a shorter sequence** - Long sequences (>1000 residues) may timeout
                 3. **Check your internet connection** - Ensure stable connectivity
                 4. **Try again later** - API servers may be under maintenance
+                5. **Use local ESMFold** - If you have a GPU with 8GB+ VRAM
                 
                 **Alternative options:**
                 - Use AlphaFold DB for known protein structures
@@ -1206,9 +1301,16 @@ with tab1:
                 - Contact ESM Atlas support if the issue persists
                 """)
                 
-                # Add a retry button
-                if st.button("🔄 Retry Prediction", type="primary"):
-                    st.rerun()
+                # Add retry and alternative options
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("🔄 Retry Prediction", type="primary", use_container_width=True):
+                        st.rerun()
+                with col2:
+                    if st.button("🖥️ Try Local ESMFold", type="secondary", use_container_width=True):
+                        # Switch to local method
+                        st.session_state.prediction_method = "Local ESMFold (Requires GPU)"
+                        st.rerun()
                 st.stop()
 
             # Validate PDB content before processing
