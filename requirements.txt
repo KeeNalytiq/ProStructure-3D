@@ -9,7 +9,7 @@ pandas
 numpy
 plotly
 mdtraj
-
+rdkit
 # Optional dependencies for local ESMFold (requires GPU)
 # torch>=1.12.0
 # transformers>=4.21.0
