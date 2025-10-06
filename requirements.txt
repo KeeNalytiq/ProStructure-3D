@@ -8,6 +8,7 @@ requests
 pandas
 numpy
 plotly
+mdtraj
 
 # Optional dependencies for local ESMFold (requires GPU)
 # torch>=1.12.0

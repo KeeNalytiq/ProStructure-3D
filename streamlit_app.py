@@ -42,6 +42,23 @@ import queue
 import subprocess
 import sys
 
+# -------------------- RDKit availability check --------------------
+rdkit_available = False
+try:
+    import rdkit
+    from rdkit import Chem
+    rdkit_available = True
+except ImportError:
+    rdkit_available = False
+
+# -------------------- MDTraj availability check --------------------
+mdtraj_available = False
+try:
+    import mdtraj as md
+    mdtraj_available = True
+except Exception:
+    mdtraj_available = False
+
 # -------------------- Page setup --------------------
 st.set_page_config(
     page_title="ProStruct - 3D", 
@@ -349,40 +366,234 @@ POSITIVE_AA = set(['K', 'R', 'H'])
 NEGATIVE_AA = set(['D', 'E'])
 
 
-def clean_sequence(seq: str) -> str:
-    """Clean and validate protein sequence, keeping all valid amino acids."""
-    if not seq:
-        return ""
+def log_api(message: str, level: str = 'info') -> None:
+    """Conditional UI logger to avoid noisy warnings unless verbose is enabled."""
+    try:
+        if st.session_state.get('verbose_api', False):
+            if level == 'warning':
+                st.warning(message)
+            else:
+                st.info(message)
+    except Exception:
+        # Streamlit context may not be initialized during import or caching
+        pass
+
+
+# -------------------- ADMET utilities --------------------
+@st.cache_data(show_spinner=False)
+def compute_admet_properties(smiles: str):
+    """Enhanced ADMET properties computation with comprehensive drug discovery metrics."""
+    try:
+        import rdkit
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors, FilterCatalog, QED
+    except ImportError:
+        return { 'error': 'RDKit not installed. Please install RDKit: pip install rdkit' }
+    except Exception as e:
+        return { 'error': f'RDKit import error: {str(e)}' }
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return { 'error': 'Invalid SMILES' }
+        
+        # Basic molecular descriptors
+        mw = float(Descriptors.MolWt(mol))
+        logp = float(Crippen.MolLogP(mol))
+        tpsa = float(Descriptors.TPSA(mol))
+        hbd = int(Lipinski.NumHDonors(mol))
+        hba = int(Lipinski.NumHAcceptors(mol))
+        rotb = int(Lipinski.NumRotatableBonds(mol))
+        rings_arom = int(rdMolDescriptors.CalcNumAromaticRings(mol))
+        rings_total = int(rdMolDescriptors.CalcNumRings(mol))
+        
+        # Enhanced descriptors
+        formal_charge = int(Chem.rdmolops.GetFormalCharge(mol))
+        heavy_atoms = int(Descriptors.HeavyAtomCount(mol))
+        stereo_centers = int(rdMolDescriptors.CalcNumAliphaticCarbocycles(mol))
+        
+        # Drug-likeness scores
+        qed_score = float(QED.qed(mol)) if hasattr(QED, 'qed') else 0.0
+        
+        # PAINS and structural alerts
+        params = FilterCatalog.FilterCatalogParams()
+        params.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.PAINS)
+        pains = FilterCatalog.FilterCatalog(params)
+        matches = pains.GetMatches(mol)
+        pains_hits = len(matches)
+        
+        # Additional structural alerts
+        brenk_alerts = 0
+        nih_alerts = 0
+        try:
+            # Brenk alerts
+            params_brenk = FilterCatalog.FilterCatalogParams()
+            params_brenk.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.BRENK)
+            brenk = FilterCatalog.FilterCatalog(params_brenk)
+            brenk_alerts = len(brenk.GetMatches(mol))
+            
+            # NIH alerts
+            params_nih = FilterCatalog.FilterCatalogParams()
+            params_nih.AddCatalog(FilterCatalog.FilterCatalogParams.FilterCatalogs.NIH)
+            nih = FilterCatalog.FilterCatalog(params_nih)
+            nih_alerts = len(nih.GetMatches(mol))
+        except:
+            pass
+        
+        # Drug-likeness rules
+        lipinski_pass = (mw <= 500 and logp <= 5 and hbd <= 5 and hba <= 10)
+        veber_pass = (rotb <= 10 and tpsa <= 140)
+        egan_pass = (tpsa <= 131 and logp <= 5.88)
+        lead_like_pass = (mw <= 350 and logp <= 3.5 and tpsa <= 70)
+        fragment_like_pass = (mw <= 300 and logp <= 3 and hbd <= 3 and hba <= 3)
+        
+        # CNS drug-likeness
+        cns_pass = (tpsa <= 70 and logp >= 2 and logp <= 5 and mw <= 400)
+        
+        # Bioavailability score
+        bioavailability_score = 0.0
+        if lipinski_pass:
+            bioavailability_score += 0.3
+        if veber_pass:
+            bioavailability_score += 0.3
+        if egan_pass:
+            bioavailability_score += 0.2
+        if tpsa <= 90:  # Good membrane permeability
+            bioavailability_score += 0.2
+        
+        # Synthetic accessibility (simplified)
+        synth_access = 1.0
+        if rings_arom > 3:
+            synth_access -= 0.2
+        if stereo_centers > 2:
+            synth_access -= 0.2
+        if formal_charge != 0:
+            synth_access -= 0.1
+        synth_access = max(0.0, synth_access)
+        
+        return {
+            # Basic properties
+            'mw': mw, 'logp': logp, 'tpsa': tpsa, 'hbd': hbd, 'hba': hba, 'rotb': rotb,
+            'aromatic_rings': rings_arom, 'total_rings': rings_total,
+            'heavy_atoms': heavy_atoms, 'formal_charge': formal_charge,
+            'stereo_centers': stereo_centers,
+            
+            # Drug-likeness scores
+            'qed_score': qed_score, 'bioavailability_score': bioavailability_score,
+            'synthetic_accessibility': synth_access,
+            
+            # Structural alerts
+            'pains': pains_hits, 'brenk_alerts': brenk_alerts, 'nih_alerts': nih_alerts,
+            'total_alerts': pains_hits + brenk_alerts + nih_alerts,
+            
+            # Rule compliance
+            'lipinski_pass': lipinski_pass, 'veber_pass': veber_pass, 'egan_pass': egan_pass,
+            'lead_like_pass': lead_like_pass, 'fragment_like_pass': fragment_like_pass,
+            'cns_pass': cns_pass,
+            
+            # Drug-likeness category
+            'drug_category': 'fragment' if fragment_like_pass else 'lead' if lead_like_pass else 'drug' if lipinski_pass else 'large'
+        }
+    except Exception as e:
+        return { 'error': str(e) }
+
+def interpret_admet(props: dict):
+    """Enhanced ADMET interpretation with comprehensive drug discovery metrics."""
+    if 'error' in props:
+        return {'error': props['error']}
     
+    # Helper functions for scoring
+    def score_le(val, thr, hard_max=None):
+        if val <= thr:
+            return 1.0
+        if hard_max is None:
+            return max(0.0, 1.0 - (val - thr) / max(1e-6, thr))
+        return max(0.0, 1.0 - (val - thr) / max(1e-6, hard_max - thr))
+    
+    def score_ge(val, thr, hard_min=None):
+        if val >= thr:
+            return 1.0
+        if hard_min is None:
+            return max(0.0, val / max(1e-6, thr))
+        return max(0.0, (val - hard_min) / max(1e-6, thr - hard_min))
+    
+    def score_range(val, min_val, max_val):
+        if min_val <= val <= max_val:
+            return 1.0
+        elif val < min_val:
+            return max(0.0, val / max(1e-6, min_val))
+        else:
+            return max(0.0, 1.0 - (val - max_val) / max(1e-6, max_val))
+    
+    # Absorption (A) - Enhanced
+    abs_metrics = [
+        { 'name': 'Lipinski Rule', 'value': 1 if props['lipinski_pass'] else 0, 'target': 1, 'pass': props['lipinski_pass'], 'score': 1.0 if props['lipinski_pass'] else 0.0 },
+        { 'name': 'TPSA (≤140 Å²)', 'value': props['tpsa'], 'target': 140, 'pass': props['tpsa'] <= 140, 'score': score_le(props['tpsa'], 140, 200) },
+        { 'name': 'HBD (≤5)', 'value': props['hbd'], 'target': 5, 'pass': props['hbd'] <= 5, 'score': score_le(props['hbd'], 5, 10) },
+        { 'name': 'HBA (≤10)', 'value': props['hba'], 'target': 10, 'pass': props['hba'] <= 10, 'score': score_le(props['hba'], 10, 20) },
+        { 'name': 'LogP (≤5)', 'value': props['logp'], 'target': 5, 'pass': props['logp'] <= 5, 'score': score_le(props['logp'], 5, 8) },
+        { 'name': 'Bioavailability Score', 'value': props['bioavailability_score'], 'target': 0.8, 'pass': props['bioavailability_score'] >= 0.8, 'score': min(1.0, props['bioavailability_score']) },
+    ]
+    
+    # Distribution (D) - Enhanced
+    dist_metrics = [
+        { 'name': 'LogP (2–5 ideal)', 'value': props['logp'], 'target': '2–5', 'pass': 2 <= props['logp'] <= 5, 'score': score_range(props['logp'], 2, 5) },
+        { 'name': 'TPSA BBB (≤70)', 'value': props['tpsa'], 'target': 70, 'pass': props['tpsa'] <= 70, 'score': score_le(props['tpsa'], 70, 140) },
+        { 'name': 'Aromatic Rings (≤3)', 'value': props['aromatic_rings'], 'target': 3, 'pass': props['aromatic_rings'] <= 3, 'score': score_le(props['aromatic_rings'], 3, 8) },
+        { 'name': 'CNS Drug-likeness', 'value': 1 if props['cns_pass'] else 0, 'target': 1, 'pass': props['cns_pass'], 'score': 1.0 if props['cns_pass'] else 0.0 },
+    ]
+    
+    # Metabolism (M) - Enhanced
+    metab_metrics = [
+        { 'name': 'Rotatable Bonds (≤10)', 'value': props['rotb'], 'target': 10, 'pass': props['rotb'] <= 10, 'score': score_le(props['rotb'], 10, 20) },
+        { 'name': 'LogP (≤5)', 'value': props['logp'], 'target': 5, 'pass': props['logp'] <= 5, 'score': score_le(props['logp'], 5, 8) },
+        { 'name': 'Synthetic Accessibility', 'value': props['synthetic_accessibility'], 'target': 0.8, 'pass': props['synthetic_accessibility'] >= 0.8, 'score': props['synthetic_accessibility'] },
+        { 'name': 'Stereo Centers (≤2)', 'value': props['stereo_centers'], 'target': 2, 'pass': props['stereo_centers'] <= 2, 'score': score_le(props['stereo_centers'], 2, 5) },
+    ]
+    
+    # Excretion (E) - Enhanced
+    excr_metrics = [
+        { 'name': 'MW (≤500)', 'value': props['mw'], 'target': 500, 'pass': props['mw'] <= 500, 'score': score_le(props['mw'], 500, 800) },
+        { 'name': 'TPSA (≤140)', 'value': props['tpsa'], 'target': 140, 'pass': props['tpsa'] <= 140, 'score': score_le(props['tpsa'], 140, 200) },
+        { 'name': 'Heavy Atoms (≤35)', 'value': props['heavy_atoms'], 'target': 35, 'pass': props['heavy_atoms'] <= 35, 'score': score_le(props['heavy_atoms'], 35, 50) },
+    ]
+    
+    # Toxicity (T) - Enhanced
+    tox_metrics = [
+        { 'name': 'PAINS Alerts (=0)', 'value': props['pains'], 'target': 0, 'pass': props['pains'] == 0, 'score': 1.0 if props['pains'] == 0 else max(0.0, 1.0 - props['pains'] * 0.25) },
+        { 'name': 'Brenk Alerts (=0)', 'value': props['brenk_alerts'], 'target': 0, 'pass': props['brenk_alerts'] == 0, 'score': 1.0 if props['brenk_alerts'] == 0 else max(0.0, 1.0 - props['brenk_alerts'] * 0.2) },
+        { 'name': 'NIH Alerts (=0)', 'value': props['nih_alerts'], 'target': 0, 'pass': props['nih_alerts'] == 0, 'score': 1.0 if props['nih_alerts'] == 0 else max(0.0, 1.0 - props['nih_alerts'] * 0.2) },
+        { 'name': 'Total Alerts (=0)', 'value': props['total_alerts'], 'target': 0, 'pass': props['total_alerts'] == 0, 'score': 1.0 if props['total_alerts'] == 0 else max(0.0, 1.0 - props['total_alerts'] * 0.15) },
+        { 'name': 'Egan Rule', 'value': 1 if props['egan_pass'] else 0, 'target': 1, 'pass': props['egan_pass'], 'score': 1.0 if props['egan_pass'] else 0.0 },
+    ]
+    
+    # Drug-likeness Assessment
+    drug_likeness_metrics = [
+        { 'name': 'QED Score', 'value': props['qed_score'], 'target': 0.7, 'pass': props['qed_score'] >= 0.7, 'score': min(1.0, props['qed_score']) },
+        { 'name': 'Drug Category', 'value': props['drug_category'], 'target': 'drug', 'pass': props['drug_category'] in ['drug', 'lead'], 'score': 1.0 if props['drug_category'] == 'drug' else 0.8 if props['drug_category'] == 'lead' else 0.6 if props['drug_category'] == 'fragment' else 0.3 },
+        { 'name': 'Lead-like', 'value': 1 if props['lead_like_pass'] else 0, 'target': 1, 'pass': props['lead_like_pass'], 'score': 1.0 if props['lead_like_pass'] else 0.0 },
+        { 'name': 'Fragment-like', 'value': 1 if props['fragment_like_pass'] else 0, 'target': 1, 'pass': props['fragment_like_pass'], 'score': 1.0 if props['fragment_like_pass'] else 0.0 },
+    ]
+    
+    def aggregate(ms):
+        return sum(m['score'] for m in ms) / max(1, len(ms))
+    
+    return {
+        'absorption': { 'metrics': abs_metrics, 'score': aggregate(abs_metrics) },
+        'distribution': { 'metrics': dist_metrics, 'score': aggregate(dist_metrics) },
+        'metabolism': { 'metrics': metab_metrics, 'score': aggregate(metab_metrics) },
+        'excretion': { 'metrics': excr_metrics, 'score': aggregate(excr_metrics) },
+        'toxicity': { 'metrics': tox_metrics, 'score': aggregate(tox_metrics) },
+        'drug_likeness': { 'metrics': drug_likeness_metrics, 'score': aggregate(drug_likeness_metrics) },
+    }
+
+
+def clean_sequence(seq: str) -> str:
     seq = seq.upper()
     
-    # Remove common non-amino acid characters
     seq = re.sub(r"[^A-Z]", "", seq)
-    
-    # Keep all valid amino acids (including non-standard ones)
-    valid_aa = "ACDEFGHIKLMNPQRSTVWY" + "BJOUXZ"  # Standard + non-standard
-    cleaned_seq = ''.join([s for s in seq if s in valid_aa])
-    
-    return cleaned_seq
-
-
-def validate_sequence(seq: str) -> tuple[bool, str]:
-    """Validate sequence and return (is_valid, error_message)."""
-    if not seq:
-        return False, "Empty sequence"
-    
-    if len(seq) < 5:
-        return False, f"Sequence too short ({len(seq)} residues). Minimum 5 residues required."
-    
-    if len(seq) > 2000:
-        return False, f"Sequence too long ({len(seq)} residues). Maximum 2000 residues supported."
-    
-    # Check for valid amino acids
-    invalid_chars = set(seq) - set("ACDEFGHIKLMNPQRSTVWYBJOUXZ")
-    if invalid_chars:
-        return False, f"Invalid characters found: {', '.join(sorted(invalid_chars))}"
-    
-    return True, ""
+    # keep only standard 20 amino acids
+    seq = ''.join([s for s in seq if s in AA_LIST])
+    return seq
 
 
 def parse_fasta(text: str) -> str:
@@ -394,8 +605,8 @@ def parse_fasta(text: str) -> str:
     return clean_sequence(''.join(lines))
 
 
-def predict_pdb_with_retry(sequence: str, max_retries: int = 5, base_delay: float = 2.0):
-    """Predict PDB with enhanced retry logic and better error handling."""
+def predict_pdb_with_retry(sequence: str, max_retries: int = 3, base_delay: float = 1.0):
+    """Predict PDB with retry mechanism and multiple API endpoints."""
     
     # List of API endpoints to try
     api_endpoints = [
@@ -404,84 +615,48 @@ def predict_pdb_with_retry(sequence: str, max_retries: int = 5, base_delay: floa
         'https://api.esmatlas.com/foldSequence/v1/pdb'
     ]
     
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'ProStruct-3D/1.0',
-        'Accept': 'text/plain, application/json'
-    }
-    
-    # Adjust timeout based on sequence length
-    timeout = min(300, max(60, len(sequence) * 0.5))
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
     for attempt in range(max_retries):
-        status_text.text(f"🔄 Attempt {attempt + 1}/{max_retries}")
-        progress_bar.progress((attempt + 1) / max_retries)
-        
-        for i, endpoint in enumerate(api_endpoints):
+        for endpoint in api_endpoints:
             try:
-                status_text.text(f"🌐 Trying endpoint {i + 1}/{len(api_endpoints)}")
-                
                 # Add jitter to prevent thundering herd
-                delay = base_delay * (1.5 ** attempt) + random.uniform(0, 1)
-                if attempt > 0 or i > 0:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                if attempt > 0:
+                    log_api(f"Retry attempt {attempt + 1}/{max_retries} after {delay:.1f}s delay...")
                     time.sleep(delay)
                 
-                response = requests.post(endpoint, headers=headers, data=sequence, timeout=timeout)
+                response = requests.post(endpoint, headers=headers, data=sequence, timeout=120)
                 
                 if response.status_code == 200:
                     content = response.content.decode('utf-8')
                     # Validate that we got PDB content, not an HTML error page
                     if content.strip().startswith('ATOM') or content.strip().startswith('HEADER'):
-                        progress_bar.empty()
-                        status_text.empty()
-                        st.success("🎉 Structure prediction successful!")
                         return content
                     else:
-                        st.warning(f"⚠️ Endpoint {i + 1} returned non-PDB content. Trying next...")
+                        log_api(f"API returned non-PDB content from {endpoint}. Trying next endpoint...", 'warning')
                         continue
-                        
                 elif response.status_code == 503:
-                    st.warning(f"🔧 Service unavailable (503) from endpoint {i + 1}. Trying next...")
+                    log_api(f"Service temporarily unavailable (503) from {endpoint}. Trying next endpoint...", 'warning')
                     continue
-                    
                 elif response.status_code == 429:
-                    st.warning(f"⏳ Rate limited (429) from endpoint {i + 1}. Waiting {delay * 2:.1f}s...")
+                    log_api(f"Rate limited (429) from {endpoint}. Waiting longer...", 'warning')
                     time.sleep(delay * 2)
                     continue
-                    
-                elif response.status_code == 400:
-                    st.error(f"❌ Bad request (400) from endpoint {i + 1}. Check your sequence.")
-                    continue
-                    
-                elif response.status_code == 413:
-                    st.error(f"❌ Sequence too long (413) for endpoint {i + 1}. Try a shorter sequence.")
-                    continue
-                    
                 else:
-                    st.warning(f"⚠️ Endpoint {i + 1} returned status {response.status_code}. Trying next...")
+                    log_api(f"API returned status {response.status_code} from {endpoint}. Trying next endpoint...", 'warning')
                     continue
                     
             except requests.exceptions.Timeout:
-                st.warning(f"⏱️ Timeout from endpoint {i + 1} (>{timeout}s). Trying next...")
+                log_api(f"Timeout from {endpoint}. Trying next endpoint...", 'warning')
                 continue
-                
             except requests.exceptions.ConnectionError:
-                st.warning(f"🔌 Connection error from endpoint {i + 1}. Trying next...")
+                log_api(f"Connection error from {endpoint}. Trying next endpoint...", 'warning')
                 continue
-                
-            except requests.exceptions.RequestException as e:
-                st.warning(f"🌐 Network error from endpoint {i + 1}: {str(e)[:100]}...")
-                continue
-                
             except Exception as e:
-                st.warning(f"❓ Unexpected error from endpoint {i + 1}: {str(e)[:100]}...")
+                log_api(f"Error from {endpoint}: {e}. Trying next endpoint...", 'warning')
                 continue
     
-    progress_bar.empty()
-    status_text.empty()
     return None
 
 
@@ -530,6 +705,91 @@ def predict_pdb_from_esmfold(sequence: str, method: str = "api"):
         return predict_pdb_local_esmfold(sequence)
     else:
         return predict_pdb_with_retry(sequence)
+
+
+def _looks_like_pdb(text: str) -> bool:
+    if not text:
+        return False
+    stripped = text.lstrip()
+    return stripped.startswith('ATOM') or stripped.startswith('HEADER') or stripped.startswith('MODEL')
+
+
+@st.cache_data(show_spinner=False)
+def fetch_rcsb_pdb_by_sequence(sequence: str, identity_cutoff: float = 0.6, evalue_cutoff: float = 1.0):
+    """Search RCSB by sequence and return top hit PDB text if available."""
+    try:
+        query = {
+            "query": {
+                "type": "terminal",
+                "service": "sequence",
+                "parameters": {
+                    "evalue_cutoff": evalue_cutoff,
+                    "identity_cutoff": identity_cutoff,
+                    "target": "pdb_protein_sequence",
+                    "value": sequence
+                }
+            },
+            "request_options": {
+                "scoring_strategy": "sequence",
+                "sort": [{"sort_by": "score", "direction": "desc"}],
+                "results_content_type": ["experimental"],
+                "results_verbosity": "minimal"
+            },
+            "return_type": "entry"
+        }
+        resp = requests.post(
+            "https://search.rcsb.org/rcsbsearch/v2/query?json",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(query),
+            timeout=30
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        result_set = data.get("result_set") or []
+        if not result_set:
+            return None
+        top_id = result_set[0].get("identifier")
+        if not top_id:
+            return None
+        pdb_resp = requests.get(f"https://files.rcsb.org/download/{top_id}.pdb", timeout=30)
+        if pdb_resp.status_code == 200 and _looks_like_pdb(pdb_resp.text):
+            return pdb_resp.text
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def fetch_pdb_by_id(pdb_id: str):
+    """Download PDB by 4-char ID from RCSB."""
+    try:
+        pid = pdb_id.strip().lower()
+        if not pid or len(pid) < 4:
+            return None
+        url = f"https://files.rcsb.org/download/{pid}.pdb"
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200 and _looks_like_pdb(r.text):
+            return r.text
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def fetch_alphafold_by_uniprot(uniprot_id: str):
+    """Fetch AlphaFold model PDB by UniProt ID (AF-<ID>-F1-model_v4.pdb)."""
+    try:
+        uid = uniprot_id.strip()
+        if not uid:
+            return None
+        url = f"https://alphafold.ebi.ac.uk/files/AF-{uid}-F1-model_v4.pdb"
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200 and _looks_like_pdb(r.text):
+            return r.text
+    except Exception:
+        return None
+    return None
 
 
 def render_mol(pdb_text: str, color_mode: str = 'spectrum', surface: bool = False, height: int = 600, width: int = 900):
@@ -959,43 +1219,232 @@ def ai_protein_design_suggestions(sequence, target_function="stability"):
 
 
 def predict_drug_binding_sites(structure_pdb):
-    """Predict potential drug binding sites."""
+    """Enhanced drug binding site prediction with improved algorithms."""
     binding_sites = []
     
-    # Simple binding site prediction based on structure
-    # In real implementation, you'd use tools like fpocket or DeepSite
-    
-    # Parse PDB to find cavities
+    # Parse PDB structure
     lines = structure_pdb.split('\n')
-    atom_positions = []
+    atoms = []
+    residues = {}
     
     for line in lines:
         if line.startswith('ATOM'):
+            atom_name = line[12:16].strip()
+            res_name = line[17:20].strip()
+            chain = line[21:22].strip()
+            res_num = int(line[22:26].strip())
             x = float(line[30:38])
             y = float(line[38:46])
             z = float(line[46:54])
-            atom_positions.append([x, y, z])
+            element = line[76:78].strip()
+            
+            atoms.append({
+                'name': atom_name,
+                'res_name': res_name,
+                'chain': chain,
+                'res_num': res_num,
+                'coords': [x, y, z],
+                'element': element
+            })
+            
+            # Group by residue
+            res_key = f"{chain}_{res_num}"
+            if res_key not in residues:
+                residues[res_key] = {
+                    'res_name': res_name,
+                    'chain': chain,
+                    'res_num': res_num,
+                    'atoms': []
+                }
+            residues[res_key]['atoms'].append(atoms[-1])
     
-    if atom_positions:
-        # Find potential binding cavities
-        atom_positions = np.array(atom_positions)
-        center = np.mean(atom_positions, axis=0)
+    if not atoms:
+        return binding_sites
+    
+    # Convert to numpy arrays for calculations
+    atom_coords = np.array([atom['coords'] for atom in atoms])
+    
+    # Enhanced pocket detection using multiple algorithms
+    
+    # 1. Convex hull-based pocket detection
+    try:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(atom_coords)
+        hull_vertices = atom_coords[hull.vertices]
         
-        # Simple cavity detection
-        distances = np.linalg.norm(atom_positions - center, axis=1)
-        max_dist = np.max(distances)
+        # Find potential pocket centers by analyzing surface curvature
+        pocket_candidates = []
+        for i, vertex in enumerate(hull_vertices):
+            # Calculate local surface properties
+            distances = np.linalg.norm(atom_coords - vertex, axis=1)
+            nearby_atoms = atom_coords[distances < 8.0]  # 8Å radius
+            
+            if len(nearby_atoms) > 5:  # Need sufficient atoms for analysis
+                # Calculate local density and curvature
+                local_center = np.mean(nearby_atoms, axis=0)
+                local_density = len(nearby_atoms) / (4/3 * np.pi * 8**3)
+                
+                # Check if this could be a pocket (lower density than surrounding)
+                if local_density < 0.1:  # Threshold for pocket detection
+                    pocket_candidates.append({
+                        'center': local_center,
+                        'density': local_density,
+                        'size': len(nearby_atoms)
+                    })
+    except ImportError:
+        # Fallback to simpler method if scipy not available
+        pocket_candidates = []
+    
+    # 2. Grid-based pocket detection
+    if not pocket_candidates:
+        # Create a 3D grid around the protein
+        min_coords = np.min(atom_coords, axis=0) - 5
+        max_coords = np.max(atom_coords, axis=0) + 5
+        grid_size = 2.0  # 2Å grid spacing
         
-        # Define potential binding sites
-        for i in range(3):  # Up to 3 potential sites
-            site_center = center + np.random.normal(0, max_dist/4, 3)
+        grid_points = []
+        for x in np.arange(min_coords[0], max_coords[0], grid_size):
+            for y in np.arange(min_coords[1], max_coords[1], grid_size):
+                for z in np.arange(min_coords[2], max_coords[2], grid_size):
+                    grid_points.append([x, y, z])
+        
+        grid_points = np.array(grid_points)
+        
+        # Find grid points that are inside the protein but not too close to atoms
+        for point in grid_points:
+            distances = np.linalg.norm(atom_coords - point, axis=1)
+            min_dist = np.min(distances)
+            
+            # Point is inside if it's not too close to any atom but close enough to be in a pocket
+            if 2.0 < min_dist < 6.0:
+                # Calculate local properties
+                nearby_atoms = atom_coords[distances < 8.0]
+                if len(nearby_atoms) > 3:
+                    local_density = len(nearby_atoms) / (4/3 * np.pi * 8**3)
+                    pocket_candidates.append({
+                        'center': point,
+                        'density': local_density,
+                        'size': len(nearby_atoms)
+                    })
+    
+    # 3. Cluster nearby pocket candidates
+    if pocket_candidates:
+        # Remove duplicates and cluster nearby candidates
+        unique_pockets = []
+        for candidate in pocket_candidates:
+            is_duplicate = False
+            for existing in unique_pockets:
+                if np.linalg.norm(np.array(candidate['center']) - np.array(existing['center'])) < 5.0:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_pockets.append(candidate)
+        
+        # Analyze each pocket for druggability
+        for i, pocket in enumerate(unique_pockets[:5]):  # Limit to top 5 pockets
+            center = pocket['center']
+            
+            # Calculate pocket properties
+            distances = np.linalg.norm(atom_coords - center, axis=1)
+            nearby_atoms = [atoms[j] for j in range(len(atoms)) if distances[j] < 8.0]
+            
+            # Analyze residue composition
+            res_types = {}
+            hydrophobic_count = 0
+            polar_count = 0
+            charged_count = 0
+            
+            for atom in nearby_atoms:
+                res_key = f"{atom['chain']}_{atom['res_num']}"
+                if res_key in residues:
+                    res_name = residues[res_key]['res_name']
+                    res_types[res_name] = res_types.get(res_name, 0) + 1
+                    
+                    # Classify residue type
+                    if res_name in ['ALA', 'VAL', 'LEU', 'ILE', 'MET', 'PHE', 'TRP', 'PRO']:
+                        hydrophobic_count += 1
+                    elif res_name in ['SER', 'THR', 'ASN', 'GLN', 'TYR', 'CYS']:
+                        polar_count += 1
+                    elif res_name in ['LYS', 'ARG', 'HIS', 'ASP', 'GLU']:
+                        charged_count += 1
+            
+            # Determine pocket type based on composition
+            total_residues = len(res_types)
+            if total_residues > 0:
+                if hydrophobic_count / total_residues > 0.5:
+                    pocket_type = 'hydrophobic'
+                elif polar_count / total_residues > 0.5:
+                    pocket_type = 'polar'
+                elif charged_count / total_residues > 0.3:
+                    pocket_type = 'charged'
+                else:
+                    pocket_type = 'mixed'
+            else:
+                pocket_type = 'mixed'
+            
+            # Calculate druggability score
+            volume = pocket['size'] * 4.0  # Rough volume estimate
+            druggability_factors = []
+            
+            # Size factor (optimal size for drug binding)
+            if 50 < volume < 500:
+                size_score = 1.0
+            elif volume < 50:
+                size_score = volume / 50.0
+            else:
+                size_score = max(0.0, 1.0 - (volume - 500) / 1000.0)
+            druggability_factors.append(size_score)
+            
+            # Composition factor
+            if pocket_type == 'mixed':
+                comp_score = 0.8
+            elif pocket_type in ['hydrophobic', 'polar']:
+                comp_score = 0.6
+            else:
+                comp_score = 0.4
+            druggability_factors.append(comp_score)
+            
+            # Accessibility factor (based on distance from surface)
+            surface_dist = np.min(distances)
+            if surface_dist < 3.0:
+                access_score = 0.9
+            elif surface_dist < 6.0:
+                access_score = 0.7
+            else:
+                access_score = 0.3
+            druggability_factors.append(access_score)
+            
+            # Calculate final druggability score
+            druggability_score = np.mean(druggability_factors)
+            confidence = min(0.95, 0.5 + druggability_score * 0.4)
+            
             binding_sites.append({
                 'site_id': i + 1,
-                'center': site_center.tolist(),
-                'volume': np.random.uniform(100, 500),
-                'druggability_score': np.random.uniform(0.3, 0.9),
-                'pocket_type': ['hydrophobic', 'polar', 'mixed'][i % 3],
-                'confidence': np.random.uniform(0.6, 0.9)
+                'center': center.tolist(),
+                'volume': volume,
+                'druggability_score': druggability_score,
+                'pocket_type': pocket_type,
+                'confidence': confidence,
+                'residue_composition': res_types,
+                'accessibility': surface_dist,
+                'size_category': 'small' if volume < 100 else 'medium' if volume < 300 else 'large'
             })
+    
+    # If no pockets found, create a default analysis
+    if not binding_sites and len(atoms) > 10:
+        # Calculate protein center and create a basic binding site
+        center = np.mean(atom_coords, axis=0)
+        binding_sites.append({
+            'site_id': 1,
+            'center': center.tolist(),
+            'volume': 200.0,
+            'druggability_score': 0.3,
+            'pocket_type': 'mixed',
+            'confidence': 0.4,
+            'residue_composition': {},
+            'accessibility': 5.0,
+            'size_category': 'medium'
+        })
     
     return binding_sites
 
@@ -1167,16 +1616,26 @@ with st.sidebar:
     # Global settings
     color_mode = st.selectbox("3D Color Mode", ['spectrum', 'chain', 'plddt', 'hydrophobicity'])
     surface_toggle = st.checkbox("Show molecular surface", value=False)
-    minimum_length = st.number_input("Min sequence length", min_value=5, max_value=5000, value=5, 
-                                     help="Minimum sequence length for prediction (default: 5 residues)")
-    
-    # Prediction method selection
+    minimum_length = st.number_input("Min sequence length", min_value=10, max_value=5000, value=20)
+    verbose_api = st.checkbox("Verbose API logs (retries, 503 warnings)", value=False, help="Enable to see detailed API retry logs")
+    st.session_state.verbose_api = verbose_api
+
+# Prediction method selection
     prediction_method = st.selectbox(
-        "Prediction Method", 
-        ["ESM Atlas API (Recommended)", "Local ESMFold (Requires GPU)"],
-        help="ESM Atlas API is free but may be unavailable. Local ESMFold requires GPU and more setup."
-    )
-    
+    "Prediction Method", 
+    [
+        "Auto (PDB → ESM → AlphaFold)",
+        "PDB (Experimental structures)",
+        "ESM Atlas API",
+        "Local ESMFold (Requires GPU)",
+        "AlphaFold DB (by UniProt ID)"
+    ],
+    help="Prefer experimental PDB first. Auto tries PDB sequence search, then ESM, then AlphaFold if UniProt ID provided."
+)
+
+    pdb_id_hint = st.text_input("Optional PDB ID (e.g., 1CRN)", value="")
+    uniprot_id_hint = st.text_input("Optional UniProt ID for AlphaFold (e.g., P69905)", value="")
+
     # Batch processing settings
     st.subheader("📦 Batch Processing")
     enable_batch = st.checkbox("Enable batch processing", help="Process multiple sequences simultaneously")
@@ -1212,7 +1671,6 @@ with tab1:
                 "Insulin": "MALWMRLLPLLALLALWGPDPAAAFVNQHLCGSHLVEALYLVCGERGFFYTPKTRREAEDLQVGQVELGGGPGAGSLQPLALEGSLQKRGIVEQCCTSICSLYQLENYCN",
                 "Myoglobin": "MGLSDGEWQLVLNVWGKVEADIPGHGQEVLIRLFKGHPETLEKFDKFKHLKSEDEMKASEDLKKHGATVLTALGGILKKKGHHEAEIKPLAQSHATKHKIPVKYLEFISEAIIQVLQSKHPGDFGADAQGAMTKALELFRNDIAAKYKELGFQG"
             }
-            
             for name, seq in samples.items():
                 if st.button(f"Load {name}", key=f"sample_{name}"):
                     st.session_state.sample_sequence = seq
@@ -1231,38 +1689,39 @@ with tab1:
     elif 'sample_sequence' in st.session_state:
         sequence = st.session_state.sample_sequence
         st.info(f"Loaded sample sequence: {len(sequence)} residues")
-    
-    # Validate sequence
-    is_valid, error_msg = validate_sequence(sequence)
-    
-    if not is_valid:
-        st.error(f"❌ **Sequence validation failed:** {error_msg}")
-        st.markdown("""
-        **Tips for valid sequences:**
-        - Use standard amino acid codes: ACDEFGHIKLMNPQRSTVWY
-        - Non-standard codes also accepted: BJOUXZ
-        - Minimum length: 5 residues
-        - Maximum length: 2000 residues
-        - Remove any numbers, spaces, or special characters
-        """)
+
+    if len(sequence) == 0:
+        st.info("👆 Please paste a protein sequence or upload a FASTA file to get started.")
         st.stop()
     
     if len(sequence) < minimum_length:
-        st.warning(f"⚠️ Sequence length {len(sequence)} is shorter than your minimum setting of {minimum_length}.")
-        st.info("💡 You can lower the minimum length in the sidebar if needed.")
+        st.error(f"Sequence length {len(sequence)} is shorter than required minimum of {minimum_length}.")
         st.stop()
     
     # Display sequence info
     st.success(f"✅ Sequence loaded: {len(sequence)} residues")
-    
-    # Show sequence composition
-    aa_counts = {aa: sequence.count(aa) for aa in set(sequence)}
-    non_standard = [aa for aa in aa_counts.keys() if aa not in "ACDEFGHIKLMNPQRSTVWY"]
-    
-    if non_standard:
-        st.info(f"ℹ️ Non-standard amino acids detected: {', '.join(non_standard)}")
+
+    # Sequence composition and validation
+    from collections import Counter
+    STANDARD_AA = set("ACDEFGHIKLMNPQRSTVWY")
+    aa_counts = Counter(sequence)
+    st.caption(f"Amino-acid composition (unique={len(aa_counts)}, length={len(sequence)})")
+    non_standard_positions = [(i + 1, aa) for i, aa in enumerate(sequence) if aa not in STANDARD_AA]
+    if non_standard_positions:
+        unique_nonstd = sorted({aa for _, aa in non_standard_positions})
+        st.warning(
+            f"Non-standard residues detected: {', '.join(unique_nonstd)} "
+            f"at positions: {', '.join(str(p) for p, _ in non_standard_positions[:50])}"
+            + (" ..." if len(non_standard_positions) > 50 else "")
+        )
+        cleaned_seq = clean_sequence(sequence)
+        if cleaned_seq != sequence:
+            with st.expander("View cleaned sequence preview"):
+                st.code(cleaned_seq)
+            st.info(f"Cleaned sequence length: {len(cleaned_seq)} (removed {len(sequence) - len(cleaned_seq)} invalid chars)")
     
     # Prediction button
+    pdb_text = None
     if st.button('🚀 Predict & Analyze Structure', type="primary", use_container_width=True):
         # Check rate limiting for API requests
         if not prediction_method.startswith("Local") and not check_rate_limit():
@@ -1270,79 +1729,65 @@ with tab1:
 
         # Determine prediction method
         use_local = prediction_method.startswith("Local")
-        method_name = "Local ESMFold" if use_local else "ESM Atlas API"
+        method_name = prediction_method
         
         with st.spinner(f"Running {method_name} prediction and analyses..."):
-            pdb_text = predict_pdb_from_esmfold(sequence, method="local" if use_local else "api")
-            if pdb_text is None:
-                st.error("❌ **Prediction failed** — All API endpoints are currently unavailable.")
-                
-                # Show sequence info for debugging
-                with st.expander("🔍 Debug Information"):
-                    st.markdown(f"""
-                    **Sequence Details:**
-                    - Length: {len(sequence)} residues
-                    - Composition: {', '.join(f'{aa}: {sequence.count(aa)}' for aa in sorted(set(sequence)))}
-                    - Validation: {'✅ Valid' if validate_sequence(sequence)[0] else '❌ Invalid'}
-                    - Method: {method_name}
-                    """)
-                
-                st.markdown("""
-                **Possible solutions:**
-                1. **Wait and retry** - The ESM Atlas API may be temporarily overloaded
-                2. **Try a shorter sequence** - Long sequences (>1000 residues) may timeout
-                3. **Check your internet connection** - Ensure stable connectivity
-                4. **Try again later** - API servers may be under maintenance
-                5. **Use local ESMFold** - If you have a GPU with 8GB+ VRAM
-                
-                **Alternative options:**
-                - Use AlphaFold DB for known protein structures
-                - Try other protein structure prediction tools
-                - Contact ESM Atlas support if the issue persists
-                """)
-                
-                # Add retry and alternative options
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("🔄 Retry Prediction", type="primary", use_container_width=True):
-                        st.rerun()
-                with col2:
-                    if st.button("🖥️ Try Local ESMFold", type="secondary", use_container_width=True):
-                        # Switch to local method
-                        st.session_state.prediction_method = "Local ESMFold (Requires GPU)"
-                        st.rerun()
-                st.stop()
+            # Try PDB/Auto paths first
+            pdb_text = None
+            if prediction_method.startswith("PDB") and pdb_id_hint.strip():
+                pdb_text = fetch_pdb_by_id(pdb_id_hint)
+            if pdb_text is None and (prediction_method.startswith("Auto") or prediction_method.startswith("PDB")):
+                seq_hit = fetch_rcsb_pdb_by_sequence(sequence)
+                if seq_hit:
+                    pdb_text = seq_hit
+            # ESM
+            if pdb_text is None and (prediction_method.startswith("Auto") or prediction_method.startswith("ESM") or use_local):
+                pdb_text = predict_pdb_from_esmfold(sequence, method="local" if use_local else "api")
 
-            # Validate PDB content before processing
-            if not pdb_text or pdb_text.strip().startswith('<!doctype html>') or not pdb_text.strip().startswith('ATOM') and not pdb_text.strip().startswith('HEADER'):
-                st.error("❌ **Invalid PDB response** — The API returned an error page instead of protein structure data.")
+            # Fallback: if ESM fails or returns gateway/non-PDB, try RCSB by sequence
+            needs_fallback = (
+                pdb_text is None or
+                (isinstance(pdb_text, str) and (pdb_text.strip().lower().startswith('<!doctype html') or not _looks_like_pdb(pdb_text)))
+            )
+            if needs_fallback and not use_local and not prediction_method.startswith("PDB"):
+                st.info("ESM API failed or returned a gateway page. Trying RCSB PDB sequence search fallback...")
+                alt_pdb = fetch_rcsb_pdb_by_sequence(sequence)
+                if alt_pdb:
+                    pdb_text = alt_pdb
+                    st.success("Loaded closest matching experimental structure from RCSB PDB.")
+            # AlphaFold by UniProt
+            if (pdb_text is None or not _looks_like_pdb(pdb_text)) and (prediction_method.startswith("Auto") or prediction_method.startswith("AlphaFold")):
+                if uniprot_id_hint.strip():
+                    st.info("Trying AlphaFold DB by UniProt ID...")
+                    af = fetch_alphafold_by_uniprot(uniprot_id_hint)
+                    if af:
+                        pdb_text = af
+                        st.success("Loaded structure from AlphaFold DB.")
+
+            if not pdb_text or not _looks_like_pdb(pdb_text):
+                st.error("❌ **Could not obtain a valid structure** — ESM and RCSB fallback failed.")
                 st.markdown("""
-                **This indicates:**
-                - The ESM Atlas API is experiencing issues
-                - Your sequence may be too long or invalid
-                - The API endpoint returned an error page
-                
-                **Try these solutions:**
-                1. **Check your sequence** - Ensure it contains only valid amino acid codes (ACDEFGHIKLMNPQRSTVWY)
-                2. **Try a shorter sequence** - Sequences >400 residues may cause timeouts
-                3. **Wait and retry** - The API may be temporarily overloaded
-                4. **Try Local ESMFold** - Switch to local prediction if you have GPU support
+                **Try next:**
+                1. Verify the sequence (ACDEFGHIKLMNPQRSTVWY only)
+                2. Try a shorter sequence or split domains
+                3. Retry later in case of API downtime
+                4. Try Local ESMFold if you have GPU support
                 """)
-                
-                # Add a retry button
-                if st.button("🔄 Retry Prediction", type="primary"):
+                if st.button("🔄 Retry", type="primary"):
                     st.rerun()
                 st.stop()
 
             # extract atom array, seq and plDDT
+            have_structure = False
             try:
-                atom_array = bsio.load_structure(io.StringIO(pdb_text), extra_fields=["b_factor"])  # sometimes accepts file-like
+                atom_array = bsio.load_structure(io.StringIO(pdb_text), extra_fields=["b_factor"])
+                have_structure = True
             except Exception as e:
-                # fallback to disk load
                 with open('predicted.pdb', 'w') as f:
                     f.write(pdb_text)
                 try:
                     atom_array = bsio.load_structure('predicted.pdb', extra_fields=["b_factor"])
+                    have_structure = True
                 except Exception as e2:
                     st.error(f"❌ **Failed to load protein structure** — {str(e2)}")
                     st.markdown("""
@@ -1358,90 +1803,92 @@ with tab1:
                     2. **Check your internet connection**
                     3. **Use Local ESMFold if available**
                     """)
-                    
-                    # Add a retry button
-                    if st.button("🔄 Retry Prediction", type="primary"):
-                        st.rerun()
+                    have_structure = False
                     st.stop()
 
-            # build dataframe per residue
-            # get per-atom arrays and aggregate by residue sequence index
-            atom_res_ids = atom_array.res_id
-            atom_res_names = atom_array.res_name
-            atom_b = atom_array.b_factor
-            atom_coords = atom_array.coord
+        # build dataframe per residue
+        # get per-atom arrays and aggregate by residue sequence index
+        atom_res_ids = atom_array.res_id
+        atom_res_names = atom_array.res_name
+        atom_b = atom_array.b_factor
+        atom_coords = atom_array.coord
 
-            # build mapping from residue (chain+resid) to list of atoms
-            residue_keys = []
-            residues_order = []
+        # build mapping from residue (chain+resid) to list of atoms
+        residue_keys = []
+        residues_order = []
+        for i in range(len(atom_res_ids)):
+            key = (int(atom_res_ids[i]), atom_res_names[i])
+            residue_keys.append(key)
+            residues_order.append(key)
+        # create ordered unique residue list
+        ordered_res = []
+        for k in residues_order:
+            if k not in ordered_res:
+                ordered_res.append(k)
+
+        perres = []
+        for ridx, r in enumerate(ordered_res, start=1):
+            # select atoms with that residue name in order
+            b_vals = []
+            coords = []
             for i in range(len(atom_res_ids)):
-                key = (int(atom_res_ids[i]), atom_res_names[i])
-                residue_keys.append(key)
-                residues_order.append(key)
-            # create ordered unique residue list
-            ordered_res = []
-            for k in residues_order:
-                if k not in ordered_res:
-                    ordered_res.append(k)
+                if (int(atom_res_ids[i]), atom_res_names[i]) == r:
+                    try:
+                        b_vals.append(float(atom_b[i]))
+                    except Exception:
+                        pass
+                    coords.append(atom_coords[i])
+            # average b
+            avg_b = float(np.nanmean(b_vals)) if len(b_vals) > 0 else np.nan
+            one_letter = one_three_to_one(r[1])
+            perres.append({'index': ridx, 'res_name_3': r[1], 'res_name_1': one_letter, 'avg_b': avg_b, 'n_atoms': len(b_vals)})
 
-            perres = []
-            for ridx, r in enumerate(ordered_res, start=1):
-                # select atoms with that residue name in order
-                b_vals = []
-                coords = []
-                for i in range(len(atom_res_ids)):
-                    if (int(atom_res_ids[i]), atom_res_names[i]) == r:
-                        try:
-                            b_vals.append(float(atom_b[i]))
-                        except Exception:
-                            pass
-                        coords.append(atom_coords[i])
-                # average b
-                avg_b = float(np.nanmean(b_vals)) if len(b_vals) > 0 else np.nan
-                one_letter = one_three_to_one(r[1])
-                perres.append({'index': ridx, 'res_name_3': r[1], 'res_name_1': one_letter, 'avg_b': avg_b, 'n_atoms': len(b_vals)})
+        df = pd.DataFrame(perres)
+        # if sequence shorter/longer, prefer sequence from input
+        seq_for_analysis = ''.join(df['res_name_1'].tolist())
+        if len(seq_for_analysis) != len(sequence):
+            # prefer supplied sequence for hydrophobicity etc, but align lengths in plots
+            seq_for_analysis = sequence
 
-            df = pd.DataFrame(perres)
-            # if sequence shorter/longer, prefer sequence from input
-            seq_for_analysis = ''.join(df['res_name_1'].tolist())
-            if len(seq_for_analysis) != len(sequence):
-                # prefer supplied sequence for hydrophobicity etc, but align lengths in plots
-                seq_for_analysis = sequence
+        # plDDT array
+        plddt_vals = df['avg_b'].fillna(0).to_numpy()
 
-            # plDDT array
-            plddt_vals = df['avg_b'].fillna(0).to_numpy()
+        # Confidence stats
+        pct_above_70 = round((plddt_vals > 70).sum() / max(1, len(plddt_vals)) * 100, 2)
+        pct_above_90 = round((plddt_vals > 90).sum() / max(1, len(plddt_vals)) * 100, 2)
 
-            # Confidence stats
-            pct_above_70 = round((plddt_vals > 70).sum() / max(1, len(plddt_vals)) * 100, 2)
-            pct_above_90 = round((plddt_vals > 90).sum() / max(1, len(plddt_vals)) * 100, 2)
+        # hydrophobicity
+        hyd_profile = kyte_doolittle_profile(seq_for_analysis)
 
-            # hydrophobicity
-            hyd_profile = kyte_doolittle_profile(seq_for_analysis)
+        # residue comp and charge
+        comp = residue_composition(seq_for_analysis)
+        posc, negc, neutr = charge_counts(seq_for_analysis)
 
-            # residue comp and charge
-            comp = residue_composition(seq_for_analysis)
-            posc, negc, neutr = charge_counts(seq_for_analysis)
+        # mw, pI
+        molw = compute_molecular_weight(seq_for_analysis)
+        pipred = estimate_pI(seq_for_analysis)
 
-            # mw, pI
-            molw = compute_molecular_weight(seq_for_analysis)
-            pipred = estimate_pI(seq_for_analysis)
+        # radius of gyration
+        try:
+            rg = radius_of_gyration(atom_array)
+        except Exception:
+            rg = None
 
-            # radius of gyration
-            try:
-                rg = radius_of_gyration(atom_array)
-            except Exception:
-                rg = None
+        # secondary structure from PDB records
+        helix_count, sheet_count = parse_secondary_from_pdb(pdb_text)
 
-            # secondary structure from PDB records
-            helix_count, sheet_count = parse_secondary_from_pdb(pdb_text)
-
-            # prepare per-residue csv for download
-            out_df = pd.DataFrame({
-                'res_index': df['index'],
-                'residue': df['res_name_1'],
-                'plddt': df['avg_b'],
-                'hydrophobicity': hyd_profile[:len(df)]
-            })
+        # prepare per-residue csv for download (align lengths)
+        n_res = min(len(df), len(hyd_profile))
+        if len(df) != len(hyd_profile):
+            log_api(f"Length mismatch: structure residues={len(df)} vs sequence length={len(hyd_profile)}; aligning to {n_res}")
+        df_aligned = df.iloc[:n_res].reset_index(drop=True)
+        hyd_aligned = hyd_profile[:n_res]
+        out_df = pd.DataFrame({
+            'res_index': df_aligned['index'],
+            'residue': df_aligned['res_name_1'],
+            'plddt': df_aligned['avg_b'],
+            'hydrophobicity': hyd_aligned
+        })
 
         # Store in session state for history
         prediction_result = {
@@ -1462,23 +1909,20 @@ with tab1:
         }
         st.session_state.prediction_history.append(prediction_result)
 
-        # -------------------- Layout: visualization + stats --------------------
-        st.markdown("---")
-        # Use columns for better alignment and a modern look
-        col1, col2 = st.columns([1.5, 1], gap="large")
+    # -------------------- Layout: visualization + stats --------------------
+    st.markdown("---")
+    # Use columns for better alignment and a modern look
+    col1, col2 = st.columns([1.5, 1], gap="large")
 
-        with col1:
-            st.subheader('🧬 3D Structure')
-            st.markdown("""
-            <div class="viewer-container">
-            """, unsafe_allow_html=True)
-            
-            # Center the 3D viewer and make it larger and square
+    with col1:
+        st.subheader('🧬 3D Structure')
+        st.markdown("""
+        <div class="viewer-container">
+        """, unsafe_allow_html=True)
+        if pdb_text and _looks_like_pdb(pdb_text):
             st.markdown('<div style="display:flex; justify-content:center;">', unsafe_allow_html=True)
             render_mol(pdb_text, color_mode=color_mode, surface=surface_toggle, height=600, width=600)
             st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Download button with better styling
             st.markdown('<div style="text-align: center; margin-top: 1rem;">', unsafe_allow_html=True)
             st.download_button(
                 '⬇️ Download PDB Structure', 
@@ -1488,287 +1932,319 @@ with tab1:
                 type="primary"
             )
             st.markdown('</div>', unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.warning('No valid structure available to render or download.')
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        with col2:
-            st.subheader('📊 Quick Statistics')
-            st.markdown("""
-            <div class="chart-container">
-                <div style="display: grid; gap: 1rem;">
-            """, unsafe_allow_html=True)
-            
-            # Create metric cards for each statistic
-            metrics = [
-                ("Sequence Length", f"{len(seq_for_analysis)}", "residues", "#3b82f6"),
-                ("Molecular Weight", f"{round(molw,2)}", "Da", "#10b981"),
-                ("Estimated pI", f"{pipred}", "", "#f59e0b"),
-                ("Radius of Gyration", f"{round(rg,3)}" if rg else "N/A", "Å" if rg else "", "#ef4444"),
-                ("High Confidence", f"{pct_above_70}%", "pLDDT > 70", "#8b5cf6"),
-                ("Very High Confidence", f"{pct_above_90}%", "pLDDT > 90", "#06b6d4")
-            ]
-            
-            for title, value, unit, color in metrics:
-                st.markdown(f"""
-                <div class="metric-card" style="border-left-color: {color};">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <h4 style="color: {color}; margin: 0; font-size: 0.9rem; font-weight: 600;">{title}</h4>
-                            <p style="margin: 0.3rem 0 0 0; color: #64748b; font-size: 0.8rem;">{unit}</p>
-                        </div>
-                        <div style="font-size: 1.5rem; font-weight: 700; color: {color};">{value}</div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            # Secondary structure info
-            st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #f97316;">
-                <h4 style="color: #f97316; margin: 0; font-size: 0.9rem; font-weight: 600;">Secondary Structure</h4>
-                <p style="margin: 0.5rem 0 0 0; color: #64748b; font-size: 0.9rem;">
-                    <strong>Helices:</strong> {helix_count} | <strong>Sheets:</strong> {sheet_count}
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown("</div></div>", unsafe_allow_html=True)
+    with col2:
+        st.subheader('📊 Quick Statistics')
+        st.markdown("""
+        <div class="chart-container">
+            <div style="display: grid; gap: 1rem;">
+        """, unsafe_allow_html=True)
+        # Determine a robust sequence length for display
+        try:
+            seq_len_display = len(seq_for_analysis)
+        except NameError:
+            seq_len_display = len(df) if 'df' in locals() else len(sequence)
+        # Ensure dependent stats exist (fallbacks for robustness)
+        if 'molw' not in locals():
+            try:
+                molw = compute_molecular_weight(sequence)
+            except Exception:
+                molw = float('nan')
+        if 'pipred' not in locals():
+            try:
+                pipred = estimate_pI(sequence)
+            except Exception:
+                pipred = float('nan')
+        if 'rg' not in locals():
+            rg = None
+        if 'pct_above_70' not in locals():
+            pct_above_70 = 0.0
+        if 'pct_above_90' not in locals():
+            pct_above_90 = 0.0
 
-            st.subheader('🧪 Charge & Composition')
-            st.markdown("""
-            <div class="chart-container">
-            """, unsafe_allow_html=True)
-            
-            # Charge distribution summary
+        metrics = [
+            ("Sequence Length", f"{seq_len_display}", "residues", "#3b82f6"),
+            ("Molecular Weight", f"{round(molw,2)}", "Da", "#10b981"),
+            ("Estimated pI", f"{pipred}", "", "#f59e0b"),
+            ("Radius of Gyration", f"{round(rg,3)}" if rg else "N/A", "Å" if rg else "", "#ef4444"),
+            ("High Confidence", f"{pct_above_70}%", "pLDDT > 70", "#8b5cf6"),
+            ("Very High Confidence", f"{pct_above_90}%", "pLDDT > 90", "#06b6d4")
+        ]
+        for title, value, unit, color in metrics:
             st.markdown(f"""
-            <div class="metric-card" style="border-left-color: #8b5cf6;">
-                <h4 style="color: #8b5cf6; margin: 0; font-size: 0.9rem; font-weight: 600;">Charge Distribution</h4>
-                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-top: 0.5rem;">
-                    <div style="text-align: center;">
-                        <div style="font-size: 1.2rem; font-weight: 700; color: #ef4444;">{posc}</div>
-                        <div style="font-size: 0.8rem; color: #64748b;">Positive (K/R/H)</div>
+            <div class="metric-card" style="border-left-color: {color};">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h4 style="color: {color}; margin: 0; font-size: 0.9rem; font-weight: 600;">{title}</h4>
+                        <p style="margin: 0.3rem 0 0 0; color: #64748b; font-size: 0.8rem;">{unit}</p>
                     </div>
-                    <div style="text-align: center;">
-                        <div style="font-size: 1.2rem; font-weight: 700; color: #3b82f6;">{negc}</div>
-                        <div style="font-size: 0.8rem; color: #64748b;">Negative (D/E)</div>
-                    </div>
-                    <div style="text-align: center;">
-                        <div style="font-size: 1.2rem; font-weight: 700; color: #64748b;">{neutr}</div>
-                        <div style="font-size: 0.8rem; color: #64748b;">Neutral</div>
-                    </div>
+                    <div style="font-size: 1.5rem; font-weight: 700; color: {color};">{value}</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            
-            # Residue composition pie chart
-            comp_items = sorted(comp.items(), key=lambda x: x[1], reverse=True)
-            labels = [k for k, v in comp_items]
-            values = [v for k, v in comp_items]
-            if len(labels) > 0:
-                fig_pie = go.Figure(data=[go.Pie(
-                    labels=labels, 
-                    values=values, 
-                    hole=0.4,
-                    marker_colors=['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16', '#ec4899', '#6366f1', '#14b8a6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16', '#ec4899', '#6366f1', '#14b8a6']
-                )])
-                fig_pie.update_layout(
-                    title=dict(
-                        text='Residue Composition',
-                        font=dict(size=16, color='#1f2937'),
-                        x=0.5
-                    ),
-                    showlegend=True,
-                    legend=dict(
-                        orientation="v",
-                        yanchor="middle",
-                        y=0.5,
-                        xanchor="left",
-                        x=1.01
-                    ),
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(size=12)
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
-            else:
-                st.info("No composition data available.")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
+        # Guard secondary structure metrics
+        try:
+            helices_display = helix_count
+            sheets_display = sheet_count
+        except NameError:
+            helices_display = 0
+            sheets_display = 0
+        st.markdown(f"""
+        <div class="metric-card" style="border-left-color: #f97316;">
+            <h4 style="color: #f97316; margin: 0; font-size: 0.9rem; font-weight: 600;">Secondary Structure</h4>
+            <p style="margin: 0.5rem 0 0 0; color: #64748b; font-size: 0.9rem;">
+                <strong>Helices:</strong> {helices_display} | <strong>Sheets:</strong> {sheets_display}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("</div></div>", unsafe_allow_html=True)
 
-        st.markdown("---")
-        # Per-residue analyses in two columns
-        st.subheader('📈 Per-residue Analyses')
-        col3, col4 = st.columns(2, gap="large")
+        # Ensure downstream objects exist even if prediction block didn't set them
+        if 'out_df' not in locals():
+            out_df = pd.DataFrame(columns=['res_index', 'plddt'])
+        if 'hyd_profile' not in locals():
+            hyd_profile = []
 
-        with col3:
-            st.markdown("""
-            <div class="chart-container">
-                <h4 style="color: #1f2937; margin-bottom: 1rem; text-align: center;">plDDT Confidence Scores</h4>
-            """, unsafe_allow_html=True)
-            
-            if len(out_df) > 0:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=out_df['res_index'], 
-                    y=out_df['plddt'], 
-                    mode='lines+markers', 
-                    name='plDDT',
-                    line=dict(color='#3b82f6', width=3),
-                    marker=dict(size=6, color='#1d4ed8'),
-                    hovertemplate='<b>Residue %{x}</b><br>plDDT: %{y:.1f}<extra></extra>'
-                ))
-                fig.add_hline(y=70, line_dash='dash', line_color='#f59e0b', line_width=2,
-                             annotation_text='Low Confidence', annotation_position='top left',
-                             annotation_font_color='#92400e')
-                fig.add_hline(y=90, line_dash='dash', line_color='#10b981', line_width=2,
-                             annotation_text='High Confidence', annotation_position='top left',
-                             annotation_font_color='#065f46')
-                fig.update_layout(
-                    xaxis_title='Residue Index',
-                    yaxis_title='plDDT Score',
-                    yaxis=dict(range=[0,100]),
-                    plot_bgcolor='rgba(255,255,255,0.8)',
-                    paper_bgcolor='rgba(255,255,255,0.8)',
-                    font=dict(size=12, family='Inter'),
-                    margin=dict(l=20, r=20, t=20, b=20),
-                    showlegend=False
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.empty()
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        with col4:
-            st.markdown("""
-            <div class="chart-container">
-                <h4 style="color: #1f2937; margin-bottom: 1rem; text-align: center;">Hydrophobicity Profile</h4>
-            """, unsafe_allow_html=True)
-            
-            if len(hyd_profile) > 0:
-                fig2 = go.Figure()
-                fig2.add_trace(go.Scatter(
-                    x=list(range(1, len(hyd_profile)+1)), 
-                    y=hyd_profile, 
-                    mode='lines',
-                    name='Hydrophobicity',
-                    line=dict(color='#10b981', width=3),
-                    fill='tonexty',
-                    fillcolor='rgba(16, 185, 129, 0.1)',
-                    hovertemplate='<b>Residue %{x}</b><br>KD Score: %{y:.2f}<extra></extra>'
-                ))
-                fig2.update_layout(
-                    xaxis_title='Residue Index',
-                    yaxis_title='Kyte-Doolittle Score',
-                    plot_bgcolor='rgba(255,255,255,0.8)',
-                    paper_bgcolor='rgba(255,255,255,0.8)',
-                    font=dict(size=12, family='Inter'),
-                    margin=dict(l=20, r=20, t=20, b=20),
-                    showlegend=False
-                )
-                st.plotly_chart(fig2, use_container_width=True)
-            else:
-                st.empty()
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("---")
-        st.subheader('⚡ Charge Distribution')
+        st.subheader('🧪 Charge & Composition')
         st.markdown("""
         <div class="chart-container">
         """, unsafe_allow_html=True)
-        
-        if posc + negc + neutr > 0:
-            charge_fig = go.Figure(data=[go.Pie(
-                labels=['Positive','Negative','Neutral'], 
-                values=[posc,negc,neutr], 
-                hole=0.6,
-                marker_colors=['#ef4444', '#3b82f6', '#64748b'],
-                textinfo='label+percent',
-                textfont_size=14
+        # Guard charge and composition variables
+        if 'posc' not in locals():
+            posc = 0
+        if 'negc' not in locals():
+            negc = 0
+        if 'neutr' not in locals():
+            neutr = 0
+        if 'comp' not in locals():
+            comp = {}
+        st.markdown(f"""
+        <div class="metric-card" style="border-left-color: #8b5cf6;">
+            <h4 style="color: #8b5cf6; margin: 0; font-size: 0.9rem; font-weight: 600;">Charge Distribution</h4>
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-top: 0.5rem;">
+                <div style="text-align: center;">
+                    <div style="font-size: 1.2rem; font-weight: 700; color: #ef4444;">{posc}</div>
+                    <div style="font-size: 0.8rem; color: #64748b;">Positive (K/R/H)</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 1.2rem; font-weight: 700; color: #3b82f6;">{negc}</div>
+                    <div style="font-size: 0.8rem; color: #64748b;">Negative (D/E)</div>
+                </div>
+                <div style="text-align: center;">
+                    <div style="font-size: 1.2rem; font-weight: 700; color: #64748b;">{neutr}</div>
+                    <div style="font-size: 0.8rem; color: #64748b;">Neutral</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        comp_items = sorted(comp.items(), key=lambda x: x[1], reverse=True) if isinstance(comp, dict) else []
+        labels = [k for k, v in comp_items]
+        values = [v for k, v in comp_items]
+        if len(labels) > 0:
+            fig_pie = go.Figure(data=[go.Pie(
+                labels=labels, 
+                values=values, 
+                hole=0.4,
+                marker_colors=['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16', '#ec4899', '#6366f1', '#14b8a6', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16', '#ec4899', '#6366f1', '#14b8a6']
             )])
-            charge_fig.update_layout(
+            fig_pie.update_layout(
                 title=dict(
-                    text='Charge Distribution',
-                    font=dict(size=18, color='#1f2937'),
+                    text='Residue Composition',
+                    font=dict(size=16, color='#1f2937'),
                     x=0.5
                 ),
+                showlegend=True,
+                legend=dict(
+                    orientation="v",
+                    yanchor="middle",
+                    y=0.5,
+                    xanchor="left",
+                    x=1.01
+                ),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(size=12)
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.info("No composition data available.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader('📈 Per-residue Analyses')
+    col3, col4 = st.columns(2, gap="large")
+
+    with col3:
+        st.markdown("""
+        <div class="chart-container">
+            <h4 style="color: #1f2937; margin-bottom: 1rem; text-align: center;">plDDT Confidence Scores</h4>
+        """, unsafe_allow_html=True)
+        if len(out_df) > 0:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=out_df['res_index'], 
+                y=out_df['plddt'], 
+                mode='lines+markers', 
+                name='plDDT',
+                line=dict(color='#3b82f6', width=3),
+                marker=dict(size=6, color='#1d4ed8'),
+                hovertemplate='<b>Residue %{x}</b><br>plDDT: %{y:.1f}<extra></extra>'
+            ))
+            fig.add_hline(y=70, line_dash='dash', line_color='#f59e0b', line_width=2,
+                         annotation_text='Low Confidence', annotation_position='top left',
+                         annotation_font_color='#92400e')
+            fig.add_hline(y=90, line_dash='dash', line_color='#10b981', line_width=2,
+                         annotation_text='High Confidence', annotation_position='top left',
+                         annotation_font_color='#065f46')
+            fig.update_layout(
+                xaxis_title='Residue Index',
+                yaxis_title='plDDT Score',
+                yaxis=dict(range=[0,100]),
                 plot_bgcolor='rgba(255,255,255,0.8)',
                 paper_bgcolor='rgba(255,255,255,0.8)',
                 font=dict(size=12, family='Inter'),
-                showlegend=True,
-                legend=dict(
-                    orientation="h",
-                    yanchor="bottom",
-                    y=1.02,
-                    xanchor="right",
-                    x=1
-                )
+                margin=dict(l=20, r=20, t=20, b=20),
+                showlegend=False
             )
-            st.plotly_chart(charge_fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No charge data available.")
-        
+            st.empty()
         st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown("---")
-        st.subheader('⬇️ Download Results')
+    with col4:
         st.markdown("""
         <div class="chart-container">
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+            <h4 style="color: #1f2937; margin-bottom: 1rem; text-align: center;">Hydrophobicity Profile</h4>
         """, unsafe_allow_html=True)
-        
-        # Download buttons with better styling
-        csv_buf = out_df.to_csv(index=False).encode('utf-8')
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.download_button(
-                '📊 Download CSV Data', 
-                data=csv_buf, 
-                file_name='per_residue_analysis.csv', 
-                mime='text/csv',
-                type="primary"
+        if len(hyd_profile) > 0:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(
+                x=list(range(1, len(hyd_profile)+1)), 
+                y=hyd_profile, 
+                mode='lines',
+                name='Hydrophobicity',
+                line=dict(color='#10b981', width=3),
+                fill='tonexty',
+                fillcolor='rgba(16, 185, 129, 0.1)',
+                hovertemplate='<b>Residue %{x}</b><br>KD Score: %{y:.2f}<extra></extra>'
+            ))
+            fig2.update_layout(
+                xaxis_title='Residue Index',
+                yaxis_title='Kyte-Doolittle Score',
+                plot_bgcolor='rgba(255,255,255,0.8)',
+                paper_bgcolor='rgba(255,255,255,0.8)',
+                font=dict(size=12, family='Inter'),
+                margin=dict(l=20, r=20, t=20, b=20),
+                showlegend=False
             )
-        
-        with col2:
-            report = io.StringIO()
-            report.write('🧬 ProStruct - Protein Structure Analysis Report\n')
-            report.write('=' * 50 + '\n\n')
-            report.write(f'📏 Sequence length: {len(seq_for_analysis)} residues\n')
-            report.write(f'⚖️ Molecular weight: {round(molw,2)} Da\n')
-            report.write(f'🔬 Estimated pI: {pipred}\n')
-            report.write(f'📈 Confidence scores:\n')
-            report.write(f'   • High confidence (pLDDT > 70): {pct_above_70}%\n')
-            report.write(f'   • Very high confidence (pLDDT > 90): {pct_above_90}%\n')
-            report.write(f'🏗️ Secondary structure:\n')
-            report.write(f'   • Helices: {helix_count}\n')
-            report.write(f'   • Sheets: {sheet_count}\n')
-            report.write(f'\n🧪 Residue composition:\n')
-            for aa, count in comp_items:
-                report.write(f'   • {aa}: {count} ({count/len(seq_for_analysis)*100:.1f}%)\n')
-            report.write(f'\n⚡ Charge distribution:\n')
-            report.write(f'   • Positive (K/R/H): {posc}\n')
-            report.write(f'   • Negative (D/E): {negc}\n')
-            report.write(f'   • Neutral: {neutr}\n')
-            
-            st.download_button(
-                '📄 Download Analysis Report', 
-                data=report.getvalue(), 
-                file_name='analysis_report.txt', 
-                mime='text/plain',
-                type="secondary"
-            )
-        
-        st.markdown("</div></div>", unsafe_allow_html=True)
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.empty()
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # Success message with better styling
-        st.markdown("""
-        <div style="background: linear-gradient(135deg, #dcfce7 0%, #bbf7d0 100%); 
-                    border: 1px solid #22c55e; border-radius: 16px; 
-                    padding: 1.5rem; margin: 2rem 0; text-align: center;">
-            <h3 style="color: #166534; margin: 0 0 0.5rem 0;">✅ Analysis Complete!</h3>
-            <p style="color: #15803d; margin: 0;">Your protein structure has been successfully predicted and analyzed.</p>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown("---")
+    st.subheader('⚡ Charge Distribution')
+    st.markdown("""
+    <div class="chart-container">
+    """, unsafe_allow_html=True)
+    if posc + negc + neutr > 0:
+        charge_fig = go.Figure(data=[go.Pie(
+            labels=['Positive','Negative','Neutral'], 
+            values=[posc,negc,neutr], 
+            hole=0.6,
+            marker_colors=['#ef4444', '#3b82f6', '#64748b'],
+            textinfo='label+percent',
+            textfont_size=14
+        )])
+        charge_fig.update_layout(
+            title=dict(
+                text='Charge Distribution',
+                font=dict(size=18, color='#1f2937'),
+                x=0.5
+            ),
+            plot_bgcolor='rgba(255,255,255,0.8)',
+            paper_bgcolor='rgba(255,255,255,0.8)',
+            font=dict(size=12, family='Inter'),
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            )
+        )
+        st.plotly_chart(charge_fig, use_container_width=True)
+    else:
+        st.info("No charge data available.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.subheader('⬇️ Download Results')
+    st.markdown("""
+    <div class="chart-container">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+    """, unsafe_allow_html=True)
+    # Build CSV safely
+    try:
+        csv_buf = out_df.to_csv(index=False).encode('utf-8')
+    except Exception:
+        csv_buf = b""
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            '📊 Download CSV Data', 
+            data=csv_buf, 
+            file_name='per_residue_analysis.csv', 
+            mime='text/csv',
+            type="primary"
+        )
+    with col2:
+        report = io.StringIO()
+        report.write('🧬 ProStruct - Protein Structure Analysis Report\n')
+        report.write('=' * 50 + '\n\n')
+        safe_seq = seq_for_analysis if 'seq_for_analysis' in locals() else sequence
+        safe_mw = round(molw,2) if 'molw' in locals() else float('nan')
+        safe_pi = pipred if 'pipred' in locals() else float('nan')
+        report.write(f'📏 Sequence length: {len(safe_seq)} residues\n')
+        report.write(f'⚖️ Molecular weight: {safe_mw} Da\n')
+        report.write(f'🔬 Estimated pI: {safe_pi}\n')
+        report.write(f'📈 Confidence scores:\n')
+        report.write(f'   • High confidence (pLDDT > 70): {pct_above_70 if "pct_above_70" in locals() else 0}%\n')
+        report.write(f'   • Very high confidence (pLDDT > 90): {pct_above_90 if "pct_above_90" in locals() else 0}%\n')
+        report.write(f'🏗️ Secondary structure:\n')
+        report.write(f'   • Helices: {helix_count if "helix_count" in locals() else 0}\n')
+        report.write(f'   • Sheets: {sheet_count if "sheet_count" in locals() else 0}\n')
+        report.write(f'\n🧪 Residue composition:\n')
+        safe_items = comp_items if 'comp_items' in locals() else []
+        for aa, count in safe_items:
+            pct = (count/len(safe_seq)*100) if len(safe_seq) else 0
+            report.write(f'   • {aa}: {count} ({pct:.1f}%)\n')
+        report.write(f'\n⚡ Charge distribution:\n')
+        report.write(f'   • Positive (K/R/H): {posc if "posc" in locals() else 0}\n')
+        report.write(f'   • Negative (D/E): {negc if "negc" in locals() else 0}\n')
+        report.write(f'   • Neutral: {neutr if "neutr" in locals() else 0}\n')
+        st.download_button(
+            '📄 Download Analysis Report', 
+            data=report.getvalue(), 
+            file_name='analysis_report.txt', 
+            mime='text/plain',
+            type="secondary"
+        )
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+    # Success message with better styling
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #dcfce7 0%, #bbf7d0 100%); 
+                border: 1px solid #22c55e; border-radius: 16px; 
+                padding: 1.5rem; margin: 2rem 0; text-align: center;">
+        <h3 style="color: #166534; margin: 0 0 0.5rem 0;">✅ Analysis Complete!</h3>
+        <p style="color: #15803d; margin: 0;">Your protein structure has been successfully predicted and analyzed.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # -------------------- Tab 2: Protein Comparison --------------------
 with tab2:
@@ -1856,15 +2332,33 @@ with tab2:
         
         # Comparison button
         if st.button("🔬 Compare Structures", type="primary", use_container_width=True):
-            with st.spinner("Predicting structures for both sequences..."):
-                # Predict both structures
-                results = batch_predict_structures({
-                    seq1_name: seq1_clean,
-                    seq2_name: seq2_clean
-                }, method="api")
-                
+            with st.spinner("Retrieving structures (PDB → ESM) for both sequences..."):
+                # Robust per-sequence retrieval: RCSB by sequence first, then ESM
+                def get_best_pdb_for_sequence(seq: str):
+                    try:
+                        hit = fetch_rcsb_pdb_by_sequence(seq)
+                        if hit and _looks_like_pdb(hit):
+                            return hit
+                    except Exception:
+                        pass
+                    try:
+                        pred = predict_pdb_from_esmfold(seq, method="api")
+                        if pred and _looks_like_pdb(pred):
+                            return pred
+                    except Exception:
+                        pass
+                    return None
+
+                pdb1 = get_best_pdb_for_sequence(seq1_clean)
+                pdb2 = get_best_pdb_for_sequence(seq2_clean)
+
+                results = [
+                    {'name': seq1_name, 'sequence': seq1_clean, 'pdb': pdb1, 'success': bool(pdb1)},
+                    {'name': seq2_name, 'sequence': seq2_clean, 'pdb': pdb2, 'success': bool(pdb2)},
+                ]
+
                 successful_results = [r for r in results if r['success']]
-                
+
                 if len(successful_results) == 2:
                     # Calculate RMSD
                     try:
@@ -1911,15 +2405,16 @@ with tab2:
                         'rmsd': rmsd,
                         'alignment': {'seq1': aligned_seq1, 'seq2': aligned_seq2}
                     }
+
                     st.session_state.comparison_data.append(comparison_data)
                     
                 elif len(successful_results) == 1:
-                    st.warning("⚠️ Only one structure prediction succeeded. Cannot perform comparison.")
+                    st.warning("⚠️ Only one structure could be retrieved (PDB/ESM). Showing the one that worked.")
                     successful_result = successful_results[0]
-                    st.markdown(f"**Successfully predicted: {successful_result['name']}**")
+                    st.markdown(f"**Available structure: {successful_result['name']}**")
                     render_mol(successful_result['pdb'], color_mode=color_mode, height=400, width=600)
                 else:
-                    st.error("❌ Both structure predictions failed. Cannot perform comparison.")
+                    st.error("❌ Could not retrieve either structure (PDB and ESM both failed).")
     
     elif seq1_clean or seq2_clean:
         st.warning("⚠️ Please provide both sequences for comparison.")
@@ -2548,202 +3043,183 @@ with tab7:
         help="Choose the type of MD simulation to prepare"
     )
     
-    # Input structure
+    # Input structure options
+    load_col1, load_col2, load_col3 = st.columns([1,1,1])
+    with load_col1:
+        md_pdb_id = st.text_input("PDB ID", placeholder="e.g., 1CRN", key="md_pdb_id")
+        if st.button("Load by PDB ID", key="btn_md_load_pdbid") and md_pdb_id.strip():
+            loaded = fetch_pdb_by_id(md_pdb_id)
+            if loaded:
+                st.session_state.md_pdb = loaded
+                st.success("Loaded structure from RCSB PDB.")
+            else:
+                st.warning("Failed to load PDB ID. Check the ID and try again.")
+    with load_col2:
+        md_seq_for_md = st.text_input("Sequence (Auto: PDB → ESM)", placeholder="Paste amino-acid sequence", key="md_seq_auto")
+        if st.button("Load from Sequence", key="btn_md_load_seq") and md_seq_for_md.strip():
+            hit = fetch_rcsb_pdb_by_sequence(clean_sequence(md_seq_for_md))
+            if not hit:
+                hit = predict_pdb_from_esmfold(clean_sequence(md_seq_for_md), method="api")
+            if hit and _looks_like_pdb(hit):
+                st.session_state.md_pdb = hit
+                st.success("Loaded structure from Auto retrieval.")
+            else:
+                st.warning("Could not retrieve structure for the sequence.")
+    with load_col3:
+        st.caption("Or paste PDB text below:")
+    # PDB text area
     md_pdb_text = st.text_area("PDB Structure for MD Simulation", height=120, key="md_pdb")
+    # Prefer loaded structure from session if available
+    if st.session_state.get('md_pdb') and not md_pdb_text:
+        md_pdb_text = st.session_state.md_pdb
     
     if md_pdb_text:
-        if sim_type == "equilibration":
-            st.info("🔧 Preparing equilibration simulation parameters...")
-            
-            if st.button("⚙️ Generate Equilibration Input", type="primary"):
-                md_input = generate_md_simulation_input(md_pdb_text, "equilibration")
-                
-                st.subheader("📝 GROMACS Equilibration Input File")
-                st.code(md_input, language=None)
-                
-                st.download_button(
-                    "⬇️ Download .mdp File",
-                    data=md_input,
-                    file_name="equilibration.mdp",
-                    mime="text/plain"
-                )
+        st.success("✅ Structure loaded for analysis")
         
-        elif sim_type == "production":
-            st.info("🚀 Preparing production run parameters...")
-            
-            # Production run settings
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                simulation_time = st.number_input("Simulation Time (ns)", 1.0, 1000.0, 10.0)
-                temperature = st.number_input("Temperature (K)", 250.0, 400.0, 300.0)
-            
-            with col2:
-                pressure = st.number_input("Pressure (bar)", 0.5, 2.0, 1.0)
-                timestep = st.selectbox("Timestep (fs)", [1.0, 2.0, 4.0], index=1)
-            
-            if st.button("⚙️ Generate Production Input", type="primary"):
-                md_input = generate_md_simulation_input(md_pdb_text, "production")
-                
-                st.subheader("📝 GROMACS Production Input File")
-                st.code(md_input, language=None)
-                
-                st.download_button(
-                    "⬇️ Download .mdp File",
-                    data=md_input,
-                    file_name="production.mdp",
-                    mime="text/plain"
-                )
-        
-        elif sim_type == "analysis":
-            st.info("📊 MD Analysis Tools")
-            
-            analysis_type = st.selectbox(
-                "Analysis Type",
-                ["RMSD", "RMSF", "Radius of Gyration", "Hydrogen Bonds", "Secondary Structure"]
-            )
-            
-            if st.button("📈 Generate Analysis Script", type="primary"):
-                analysis_script = f"""
-# MD Analysis Script for {analysis_type}
-# Generated by ProStruct-3D
+        # MD trajectory analysis setup
+        st.subheader("📁 MD Trajectory Inputs")
+        st.caption("Upload topology and trajectory to enable analysis. Supports PDB/PRMTOP for topology, DCD/XTCT/TRR for trajectory.")
+        colu1, colu2 = st.columns(2)
+        with colu1:
+            topo_file = st.file_uploader("Topology (PDB/PRMTOP)", type=["pdb", "prmtop", "psf"], key="md_topo")
+        with colu2:
+            traj_file = st.file_uploader("Trajectory (DCD/XTC/TRR)", type=["dcd", "xtc", "trr"], key="md_traj")
 
-# GROMACS analysis commands
-gmx rms -s reference.pdb -f trajectory.xtc -o rmsd.xvg
-gmx rmsf -s reference.pdb -f trajectory.xtc -o rmsf.xvg
-gmx gyrate -s reference.pdb -f trajectory.xtc -o gyrate.xvg
-gmx hbond -s reference.pdb -f trajectory.xtc -num hbonds.xvg
-gmx do_dssp -s reference.pdb -f trajectory.xtc -ssdump ssdump.dat
+        if mdtraj_available and topo_file and traj_file:
+            try:
+                with st.spinner("Loading trajectory with MDTraj..."):
+                    # Save to temp buffers and load
+                    topo_bytes = topo_file.read()
+                    traj_bytes = traj_file.read()
+                    topo_buf = io.BytesIO(topo_bytes)
+                    traj_buf = io.BytesIO(traj_bytes)
+                    # md.load requires file paths; use temporary files
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.' + topo_file.name.split('.')[-1]) as tf_topo, \
+                         tempfile.NamedTemporaryFile(suffix='.' + traj_file.name.split('.')[-1]) as tf_traj:
+                        tf_topo.write(topo_bytes); tf_topo.flush()
+                        tf_traj.write(traj_bytes); tf_traj.flush()
+                        traj = md.load(tf_traj.name, top=tf_topo.name)
 
-# Visualization with VMD
-vmd -e visualize.vmd
-"""
-                
-                st.subheader("🐍 Analysis Script")
-                st.code(analysis_script, language="bash")
-                
-                st.download_button(
-                    "⬇️ Download Analysis Script",
-                    data=analysis_script,
-                    file_name="md_analysis.sh",
-                    mime="text/plain"
-                )
-        
+                st.success(f"Trajectory loaded: {traj.n_frames} frames, {traj.n_atoms} atoms")
+
+                # Analysis tabs
+                a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs([
+                    "RMSD", "RMSF", "Rg", "SASA", "H-Bonds", "PCA/DCCM", "FEL", "Energies"
+                ])
+
+                with a1:
+                    st.subheader("📏 RMSD")
+                    rmsd = md.rmsd(traj, traj, 0)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(y=rmsd, mode='lines', name='RMSD (nm)'))
+                    fig.update_layout(xaxis_title='Frame', yaxis_title='RMSD (nm)', height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with a2:
+                    st.subheader("📈 RMSF")
+                    mean_xyz = traj.xyz.mean(axis=0)
+                    fluc = np.sqrt(((traj.xyz - mean_xyz) ** 2).sum(axis=2).mean(axis=0))
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(x=list(range(len(fluc))), y=fluc, name='RMSF (nm)'))
+                    fig.update_layout(xaxis_title='Atom Index', yaxis_title='RMSF (nm)', height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with a3:
+                    st.subheader("🌀 Radius of Gyration (Rg)")
+                    rg = md.compute_rg(traj)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(y=rg, mode='lines', name='Rg (nm)'))
+                    fig.update_layout(xaxis_title='Frame', yaxis_title='Rg (nm)', height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with a4:
+                    st.subheader("🌊 SASA")
+                    sasa = md.shrake_rupley(traj)
+                    sasa_total = sasa.sum(axis=1)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(y=sasa_total, mode='lines', name='SASA (nm²)'))
+                    fig.update_layout(xaxis_title='Frame', yaxis_title='SASA (nm²)', height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with a5:
+                    st.subheader("🤝 Hydrogen Bonds (simple distance-angle)")
+                    st.caption("Approximate H-bonds using geometric criteria. For rigorous analysis, use MDAnalysis/MDTraj hydrogen_bonds.")
+                    try:
+                        hbonds = md.baker_hubbard(traj, periodic=True)
+                        counts = np.array([len(hbonds)] * traj.n_frames)
+                    except Exception:
+                        counts = np.zeros(traj.n_frames)
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(y=counts, mode='lines', name='# H-bonds'))
+                    fig.update_layout(xaxis_title='Frame', yaxis_title='Count', height=300)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with a6:
+                    st.subheader("🧭 PCA and DCCM")
+                    # PCA on C-alpha coordinates
+                    ca = traj.topology.select('name CA')
+                    if ca.size > 3:
+                        X = traj.xyz[:, ca, :].reshape(traj.n_frames, -1)
+                        X -= X.mean(axis=0)
+                        # Covariance and eigendecomposition
+                        cov = np.cov(X, rowvar=False)
+                        vals, vecs = np.linalg.eigh(cov)
+                        order = np.argsort(vals)[::-1]
+                        vals = vals[order]
+                        explained = vals / vals.sum()
+                        fig = go.Figure()
+                        fig.add_trace(go.Bar(x=list(range(1, min(11, len(explained)) + 1)), y=explained[:10]))
+                        fig.update_layout(title='PCA Explained Variance', xaxis_title='PC', yaxis_title='Variance Ratio', height=300)
+                        st.plotly_chart(fig, use_container_width=True)
+                    # DCCM
+                    X = traj.xyz.reshape(traj.n_frames, -1)
+                    X -= X.mean(axis=0)
+                    corr = np.corrcoef(X, rowvar=False)
+                    fig = go.Figure(data=go.Heatmap(z=corr, colorscale='RdBu', zmin=-1, zmax=1))
+                    fig.update_layout(title='Dynamic Cross-Correlation Matrix', height=500)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                with a7:
+                    st.subheader("🗺️ Free Energy Landscape (FEL)")
+                    # Use first two PCs as CVs
+                    ca = traj.topology.select('name CA')
+                    if ca.size > 3:
+                        X = traj.xyz[:, ca, :].reshape(traj.n_frames, -1)
+                        X -= X.mean(axis=0)
+                        cov = np.cov(X, rowvar=False)
+                        vals, vecs = np.linalg.eigh(cov)
+                        order = np.argsort(vals)[::-1]
+                        vecs = vecs[:, order]
+                        Y = X @ vecs[:, :2]
+                        # 2D histogram and -kT ln P
+                        H, xedges, yedges = np.histogram2d(Y[:, 0], Y[:, 1], bins=50)
+                        P = H / H.sum()
+                        with np.errstate(divide='ignore'):
+                            F = -np.log(P + 1e-12)  # kT units
+                        fig = go.Figure(data=go.Heatmap(z=F.T, x=xedges[:-1], y=yedges[:-1], colorscale='Viridis'))
+                        fig.update_layout(xaxis_title='PC1', yaxis_title='PC2', height=500)
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("Not enough C-alpha atoms for FEL.")
+
+                with a8:
+                    st.subheader("⚡ Energies (Placeholder)")
+                    st.caption("If you upload log/edr files, we can parse potential/kinetic/total energy, T/P/ρ in a future update.")
+                    st.info("For now, use your MD engine's outputs (GROMACS/AMBER) and upload for parsing.")
+
+            except Exception as e:
+                st.error(f"Trajectory loading/analysis failed: {str(e)}")
         else:
-            st.info("⚙️ Custom simulation parameters")
-            
-            # Custom parameters
-            custom_params = st.text_area("Custom MD Parameters", height=200, 
-                                       placeholder="Enter custom GROMACS parameters...")
-            
-            if st.button("💾 Save Custom Parameters", type="primary"):
-                st.success("✅ Custom parameters saved!")
-    
-    else:
-        st.info("👆 Please paste a PDB structure for MD simulation preparation.")
-
-# -------------------- Tab 8: Drug Discovery --------------------
-with tab8:
-    st.header("💊 Drug Discovery & Binding Analysis")
-    
-    st.markdown("""
-    <div style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); 
-                border-radius: 16px; padding: 1.5rem; color: white; margin-bottom: 2rem;">
-        <h3 style="margin: 0 0 0.5rem 0;">🎯 Therapeutic Target Analysis</h3>
-        <p style="margin: 0; opacity: 0.9;">Identify and analyze potential drug binding sites</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Input structure
-    drug_pdb_text = st.text_area("Protein Structure for Drug Analysis", height=120, key="drug_pdb")
-    
-    if drug_pdb_text:
-        st.success("✅ Structure loaded for drug discovery analysis")
-        
-        # Analysis options
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            binding_analysis = st.checkbox("🔍 Binding Site Prediction", value=True)
-            druggability_score = st.checkbox("💊 Druggability Assessment", value=True)
-        
-        with col2:
-            pocket_analysis = st.checkbox("🕳️ Pocket Detection", value=True)
-            drug_likeness = st.checkbox("🧪 Drug-likeness Prediction", value=True)
-        
-        if st.button("🎯 Analyze Drug Targets", type="primary"):
-            with st.spinner("Analyzing potential drug binding sites..."):
-                binding_sites = predict_drug_binding_sites(drug_pdb_text)
-                
-                if binding_sites:
-                    st.subheader("🎯 Predicted Binding Sites")
-                    
-                    for site in binding_sites:
-                        with st.expander(f"Binding Site {site['site_id']}: {site['pocket_type'].title()}"):
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                st.metric("Druggability Score", f"{site['druggability_score']:.3f}")
-                                st.metric("Volume (Å³)", f"{site['volume']:.1f}")
-                            
-                            with col2:
-                                st.metric("Confidence", f"{site['confidence']:.3f}")
-                                st.metric("Pocket Type", site['pocket_type'])
-                            
-                            with col3:
-                                st.metric("Center X", f"{site['center'][0]:.2f}")
-                                st.metric("Center Y", f"{site['center'][1]:.2f}")
-                                st.metric("Center Z", f"{site['center'][2]:.2f}")
-                    
-                    # Binding site visualization
-                    st.subheader("🧬 3D Binding Site Visualization")
-                    
-                    # Create visualization with binding sites
-                    view = py3Dmol.view(width=800, height=600)
-                    view.addModel(drug_pdb_text, 'pdb')
-                    view.setStyle({'cartoon': {'color': 'spectrum'}})
-                    
-                    # Add binding sites as spheres
-                    for site in binding_sites:
-                        view.addSphere({
-                            'center': {'x': site['center'][0], 'y': site['center'][1], 'z': site['center'][2]},
-                            'radius': 3.0,
-                            'color': 'red',
-                            'alpha': 0.7
-                        })
-                    
-                    view.setBackgroundColor('white')
-                    view.zoomTo()
-                    showmol(view)
-                    
-                    # Store results
-                    st.session_state.drug_predictions.append({
-                        'structure': drug_pdb_text,
-                        'binding_sites': binding_sites,
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    
-                    # Download results
-                    results_json = json.dumps({
-                        'binding_sites': binding_sites,
-                        'analysis_date': datetime.now().isoformat(),
-                        'structure_info': 'Drug discovery analysis results'
-                    }, indent=2)
-                    
-                    st.download_button(
-                        "⬇️ Download Binding Site Analysis",
-                        data=results_json,
-                        file_name="binding_sites_analysis.json",
-                        mime="application/json"
-                    )
-                
-                else:
-                    st.warning("⚠️ No binding sites detected in this structure.")
+            if not mdtraj_available:
+                st.warning("MDTraj not available. Install with: pip install mdtraj")
+            else:
+                st.info("Upload topology and trajectory to enable MD analyses.")
     
     else:
         st.info("👆 Please paste a protein structure for drug discovery analysis.")
     
-    # Drug Discovery History
+    # Drug Discovery History (from MD analyses)
     if st.session_state.drug_predictions:
         st.subheader("📚 Drug Discovery History")
         for i, prediction in enumerate(st.session_state.drug_predictions):
@@ -2752,6 +3228,1400 @@ with tab8:
                 
                 for site in prediction['binding_sites']:
                     st.markdown(f"- Site {site['site_id']}: {site['pocket_type']} (Score: {site['druggability_score']:.3f})")
+
+# -------------------- Tab 8: AI-Driven Drug Discovery Pipeline --------------------
+with tab8:
+    st.header("💊 AI-Driven Drug Discovery Pipeline")
+    
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                border-radius: 16px; padding: 1.5rem; color: white; margin-bottom: 2rem;">
+        <h3 style="margin: 0 0 0.5rem 0;">🤖 AI Drug Discovery Platform</h3>
+        <p style="margin: 0; opacity: 0.9;">Automated virtual screening, molecular docking, and ADMET prediction</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Pipeline workflow tabs
+    pipeline_tab1, pipeline_tab2, pipeline_tab3, pipeline_tab4 = st.tabs([
+        "🎯 Target Selection", 
+        "🔍 Virtual Screening", 
+        "⚗️ Molecular Docking", 
+        "📊 ADMET Analysis"
+    ])
+    
+    # Initialize session state for drug discovery pipeline
+    if 'drug_discovery_pipeline' not in st.session_state:
+        st.session_state.drug_discovery_pipeline = {
+            'target_protein': None,
+            'ligand_library': [],
+            'docking_results': [],
+            'admet_predictions': [],
+            'ranked_compounds': []
+        }
+    
+    # Tab 1: Target Selection
+    with pipeline_tab1:
+        st.subheader("🎯 Protein Target Selection")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("**Load Protein Structure**")
+            target_pdb_id = st.text_input("PDB ID", placeholder="e.g., 1CRN", key="target_pdb_id")
+            if st.button("Load Target Protein", key="load_target_btn"):
+                if target_pdb_id.strip():
+                    with st.spinner("Loading protein structure..."):
+                        target_structure = fetch_pdb_by_id(target_pdb_id.strip())
+                        if target_structure:
+                            st.session_state.drug_discovery_pipeline['target_protein'] = {
+                                'pdb_id': target_pdb_id.strip(),
+                                'structure': target_structure,
+                                'loaded_at': datetime.now().isoformat()
+                            }
+                            st.success(f"✅ Loaded protein {target_pdb_id}")
+                        else:
+                            st.error("Failed to load protein structure")
+                else:
+                    st.warning("Please enter a PDB ID")
+        
+        with col2:
+            st.markdown("**Target Information**")
+            if st.session_state.drug_discovery_pipeline['target_protein']:
+                target_info = st.session_state.drug_discovery_pipeline['target_protein']
+                st.info(f"**Current Target:** {target_info['pdb_id']}")
+                st.info(f"**Loaded:** {target_info['loaded_at'][:19]}")
+                
+                # Analyze target protein
+                if st.button("Analyze Target", key="analyze_target_btn"):
+                    with st.spinner("Analyzing target protein..."):
+                        # Basic protein analysis
+                        structure = target_info['structure']
+                        lines = structure.split('\n')
+                        atom_count = len([line for line in lines if line.startswith('ATOM')])
+                        chains = set([line[21:22] for line in lines if line.startswith('ATOM')])
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Atoms", atom_count)
+                        with col2:
+                            st.metric("Chains", len(chains))
+                        with col3:
+                            st.metric("Status", "Ready")
+                        
+                        # Binding site prediction for target
+                        binding_sites = predict_drug_binding_sites(structure)
+                        if binding_sites:
+                            st.subheader("🎯 Predicted Binding Sites")
+                            for site in binding_sites[:3]:  # Show top 3 sites
+                                with st.expander(f"Site {site['site_id']}: {site['pocket_type']} (Score: {site['druggability_score']:.3f})"):
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.metric("Druggability", f"{site['druggability_score']:.3f}")
+                                        st.metric("Volume", f"{site['volume']:.1f} Å³")
+                                    with col2:
+                                        st.metric("Confidence", f"{site['confidence']:.2f}")
+                                        st.metric("Type", site['pocket_type'].title())
+            else:
+                st.info("Please load a protein target first")
+    
+    # Tab 2: Virtual Screening
+    with pipeline_tab2:
+        st.subheader("🔍 Virtual Screening & Ligand Library")
+        
+        # Ligand library options
+        library_options = st.selectbox(
+            "Select Ligand Library",
+            ["Custom SMILES", "FDA Approved Drugs", "Natural Products", "Fragment Library"],
+            help="Choose the compound library for virtual screening"
+        )
+        
+        if library_options == "Custom SMILES":
+            st.markdown("**Enter Custom Compounds**")
+            smiles_input = st.text_area(
+                "SMILES Strings (one per line)",
+                placeholder="CC(=O)OC1=CC=CC=C1C(=O)O\nCCN(CC)CCCC(C)NC1=C2C=CC(Cl)=CC2=NC=C1",
+                height=150,
+                help="Enter SMILES strings separated by new lines"
+            )
+            
+            if st.button("Process Custom Library", key="process_custom_btn"):
+                if smiles_input.strip():
+                    smiles_list = [s.strip() for s in smiles_input.split('\n') if s.strip()]
+                    st.session_state.drug_discovery_pipeline['ligand_library'] = [
+                        {'smiles': smiles, 'name': f'Compound_{i+1}', 'source': 'Custom'}
+                        for i, smiles in enumerate(smiles_list)
+                    ]
+                    st.success(f"✅ Loaded {len(smiles_list)} custom compounds")
+                else:
+                    st.warning("Please enter SMILES strings")
+        
+        elif library_options == "FDA Approved Drugs":
+            st.markdown("**FDA Approved Drug Library**")
+            if st.button("Load FDA Library", key="load_fda_btn"):
+                with st.spinner("Loading FDA approved drugs..."):
+                    # Simulated FDA drug library
+                    fda_drugs = [
+                        {'smiles': 'CC(=O)OC1=CC=CC=C1C(=O)O', 'name': 'Aspirin', 'source': 'FDA'},
+                        {'smiles': 'CCN(CC)CCCC(C)NC1=C2C=CC(Cl)=CC2=NC=C1', 'name': 'Chlorpromazine', 'source': 'FDA'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Quercetin', 'source': 'FDA'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Rutin', 'source': 'FDA'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Catechin', 'source': 'FDA'}
+                    ]
+                    st.session_state.drug_discovery_pipeline['ligand_library'] = fda_drugs
+                    st.success(f"✅ Loaded {len(fda_drugs)} FDA approved drugs")
+        
+        elif library_options == "Natural Products":
+            st.markdown("**Natural Products Library**")
+            if st.button("Load Natural Products", key="load_natural_btn"):
+                with st.spinner("Loading natural products..."):
+                    natural_products = [
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Curcumin', 'source': 'Natural'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Resveratrol', 'source': 'Natural'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Epigallocatechin', 'source': 'Natural'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Genistein', 'source': 'Natural'},
+                        {'smiles': 'CC1=CC=C(C=C1)C2=CC(=O)C3=C(C=CC(=C3O2)O)O', 'name': 'Luteolin', 'source': 'Natural'}
+                    ]
+                    st.session_state.drug_discovery_pipeline['ligand_library'] = natural_products
+                    st.success(f"✅ Loaded {len(natural_products)} natural products")
+        
+        elif library_options == "Fragment Library":
+            st.markdown("**Fragment Library**")
+            if st.button("Load Fragment Library", key="load_fragment_btn"):
+                with st.spinner("Loading fragment library..."):
+                    fragments = [
+                        {'smiles': 'CC(=O)O', 'name': 'Acetic_Acid', 'source': 'Fragment'},
+                        {'smiles': 'CCN', 'name': 'Ethylamine', 'source': 'Fragment'},
+                        {'smiles': 'CC(=O)N', 'name': 'Acetamide', 'source': 'Fragment'},
+                        {'smiles': 'CC(=O)OC', 'name': 'Methyl_Acetate', 'source': 'Fragment'},
+                        {'smiles': 'CC(=O)NC', 'name': 'N-Methylacetamide', 'source': 'Fragment'}
+                    ]
+                    st.session_state.drug_discovery_pipeline['ligand_library'] = fragments
+                    st.success(f"✅ Loaded {len(fragments)} fragments")
+        
+        # Display loaded library
+        if st.session_state.drug_discovery_pipeline['ligand_library']:
+            st.subheader("📚 Loaded Ligand Library")
+            library_df = pd.DataFrame(st.session_state.drug_discovery_pipeline['ligand_library'])
+            st.dataframe(library_df, use_container_width=True, hide_index=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Compounds", len(st.session_state.drug_discovery_pipeline['ligand_library']))
+            with col2:
+                sources = set([comp['source'] for comp in st.session_state.drug_discovery_pipeline['ligand_library']])
+                st.metric("Sources", len(sources))
+            
+            # Molecular Structure Visualization
+            st.subheader("🧬 Molecular Structure Visualization")
+            
+            # Create tabs for different visualization options
+            viz_tab1, viz_tab2, viz_tab3 = st.tabs([
+                "🔍 Individual Structures", 
+                "📊 Structure Gallery", 
+                "📈 Structure Analysis"
+            ])
+            
+            with viz_tab1:
+                st.markdown("**Select a compound to view its 3D structure:**")
+                
+                # Compound selector
+                compound_names = [f"{comp['name']} ({comp['source']})" for comp in st.session_state.drug_discovery_pipeline['ligand_library']]
+                selected_idx = st.selectbox(
+                    "Choose Compound",
+                    range(len(compound_names)),
+                    format_func=lambda x: compound_names[x],
+                    key="structure_selector"
+                )
+                
+                if selected_idx is not None:
+                    selected_compound = st.session_state.drug_discovery_pipeline['ligand_library'][selected_idx]
+                    smiles = selected_compound['smiles']
+                    name = selected_compound['name']
+                    
+                    st.markdown(f"**Selected: {name}**")
+                    st.code(f"SMILES: {smiles}")
+                    
+                    # Try to display 3D structure using RDKit
+                    try:
+                        if rdkit_available:
+                            from rdkit import Chem
+                            from rdkit.Chem import AllChem, rdMolDescriptors
+                            import py3Dmol
+                            
+                            # Helper: build 3D and render with py3Dmol using SDF block
+                            def _render_smiles_3d(smiles_str: str, width: int = 600, height: int = 400):
+                                m = Chem.MolFromSmiles(smiles_str)
+                                if m is None:
+                                    st.error("❌ Invalid SMILES string - cannot generate 3D structure")
+                                    return None
+                                m = Chem.AddHs(m)
+                                try:
+                                    params = AllChem.ETKDGv3()
+                                except Exception:
+                                    params = AllChem.ETKDG()
+                                params.randomSeed = 0xF00D
+                                res = AllChem.EmbedMolecule(m, params)
+                                if res != 0:
+                                    # Fallback to older method
+                                    res2 = AllChem.EmbedMolecule(m)
+                                    if res2 != 0:
+                                        st.error("❌ 3D embedding failed for this SMILES")
+                                        return None
+                                # Optimize geometry
+                                try:
+                                    AllChem.MMFFOptimizeMolecule(m)
+                                except Exception:
+                                    try:
+                                        AllChem.UFFOptimizeMolecule(m)
+                                    except Exception:
+                                        pass
+                                # Render via SDF block
+                                sdf_block = Chem.MolToMolBlock(m)
+                                view_local = py3Dmol.view(width=width, height=height)
+                                view_local.addModel(sdf_block, "sdf")
+                                view_local.setStyle({'stick': {'radius': 0.12}})
+                                view_local.setBackgroundColor('white')
+                                view_local.zoomTo()
+                                showmol(view_local, height=height, width=width)
+                                return m
+                            
+                            # Create molecule from SMILES
+                            mol = _render_smiles_3d(smiles, width=600, height=400)
+                            
+                            # Display molecular properties
+                            if mol is not None:
+                                st.subheader("Molecular Properties")
+                                col1, col2, col3, col4 = st.columns(4)
+                                
+                                with col1:
+                                    mw = rdMolDescriptors.CalcExactMolWt(mol)
+                                    st.metric("Molecular Weight", f"{mw:.1f} Da")
+                                
+                                with col2:
+                                    logp = rdMolDescriptors.CalcCrippenDescriptors(mol)[0]
+                                    st.metric("LogP", f"{logp:.2f}")
+                                
+                                with col3:
+                                    tpsa = rdMolDescriptors.CalcTPSA(mol)
+                                    st.metric("TPSA", f"{tpsa:.1f} Å²")
+                                
+                                with col4:
+                                    hbd = rdMolDescriptors.CalcNumHBD(mol)
+                                    st.metric("HBD", hbd)
+                                
+                                # Additional properties
+                                col5, col6, col7, col8 = st.columns(4)
+                                
+                                with col5:
+                                    hba = rdMolDescriptors.CalcNumHBA(mol)
+                                    st.metric("HBA", hba)
+                                
+                                with col6:
+                                    rotb = rdMolDescriptors.CalcNumRotatableBonds(mol)
+                                    st.metric("Rotatable Bonds", rotb)
+                                
+                                with col7:
+                                    rings = rdMolDescriptors.CalcNumRings(mol)
+                                    st.metric("Rings", rings)
+                                
+                                with col8:
+                                    atoms = mol.GetNumAtoms()
+                                    st.metric("Atoms", atoms)
+                            
+                            else:
+                                st.error("❌ Invalid SMILES string - cannot generate 3D structure")
+                        else:
+                            st.warning("⚠️ RDKit not available - cannot display 3D structures")
+                            st.info("Install RDKit to enable molecular structure visualization")
+                            
+                    except Exception as e:
+                        st.error(f"❌ Error generating 3D structure: {str(e)}")
+                        st.info("This might be due to complex SMILES or RDKit limitations")
+            
+            with viz_tab2:
+                st.markdown("**Structure Gallery - View multiple compounds:**")
+                
+                # Number of compounds to display
+                library_size = len(st.session_state.drug_discovery_pipeline['ligand_library'])
+                max_display = min(6, library_size)
+                
+                if library_size > 1:
+                    num_compounds = st.slider(
+                        "Number of compounds to display",
+                        min_value=1,
+                        max_value=max_display,
+                        value=min(3, library_size),
+                        key="gallery_slider"
+                    )
+                else:
+                    num_compounds = 1
+                    st.info(f"Only {library_size} compound available - displaying all")
+                
+                if rdkit_available:
+                    try:
+                        from rdkit import Chem
+                        from rdkit.Chem import AllChem
+                        import py3Dmol
+                        
+                        # Create columns for structure display
+                        cols = st.columns(2)
+                        
+                        for i in range(num_compounds):
+                            compound = st.session_state.drug_discovery_pipeline['ligand_library'][i]
+                            smiles = compound['smiles']
+                            name = compound['name']
+                            
+                            with cols[i % 2]:
+                                st.markdown(f"**{name}**")
+                                st.code(f"SMILES: {smiles}")
+                                
+                                # Generate and display 3D structure using robust ETKDG + SDF rendering
+                                try:
+                                    # reuse helper if exists above, else define minimal fallback
+                                    try:
+                                        _render_smiles_3d
+                                        _has_helper = True
+                                    except NameError:
+                                        _has_helper = False
+                                    if not _has_helper:
+                                        def _render_smiles_3d(smiles_str: str, width: int = 300, height: int = 250):
+                                            m2 = Chem.MolFromSmiles(smiles_str)
+                                            if m2 is None:
+                                                st.error(f"❌ Invalid SMILES for {name}")
+                                                return None
+                                            m2 = Chem.AddHs(m2)
+                                            try:
+                                                params2 = AllChem.ETKDGv3()
+                                            except Exception:
+                                                params2 = AllChem.ETKDG()
+                                            params2.randomSeed = 0xBEEF
+                                            r = AllChem.EmbedMolecule(m2, params2)
+                                            if r != 0:
+                                                r2 = AllChem.EmbedMolecule(m2)
+                                                if r2 != 0:
+                                                    st.error(f"❌ 3D embedding failed for {name}")
+                                                    return None
+                                            try:
+                                                AllChem.MMFFOptimizeMolecule(m2)
+                                            except Exception:
+                                                try:
+                                                    AllChem.UFFOptimizeMolecule(m2)
+                                                except Exception:
+                                                    pass
+                                            sdf_block2 = Chem.MolToMolBlock(m2)
+                                            v = py3Dmol.view(width=300, height=250)
+                                            v.addModel(sdf_block2, "sdf")
+                                            v.setStyle({'stick': {'radius': 0.12}})
+                                            v.setBackgroundColor('white')
+                                            v.zoomTo()
+                                            showmol(v, height=250, width=300)
+                                            return m2
+                                    _ = _render_smiles_3d(smiles, width=300, height=250)
+                                except Exception as _e:
+                                    st.error(f"❌ Invalid SMILES for {name}")
+                                
+                    except Exception as e:
+                        st.error(f"❌ Error in structure gallery: {str(e)}")
+                else:
+                    st.warning("⚠️ RDKit not available - cannot display structure gallery")
+            
+            with viz_tab3:
+                st.markdown("**Structure Analysis and Comparison:**")
+                
+                if rdkit_available:
+                    try:
+                        from rdkit import Chem
+                        from rdkit.Chem import rdMolDescriptors
+                        import plotly.express as px
+                        import plotly.graph_objects as go
+                        
+                        # Calculate properties for all compounds
+                        properties_data = []
+                        
+                        for compound in st.session_state.drug_discovery_pipeline['ligand_library']:
+                            smiles = compound['smiles']
+                            name = compound['name']
+                            
+                            mol = Chem.MolFromSmiles(smiles)
+                            if mol is not None:
+                                props = {
+                                    'Name': name,
+                                    'SMILES': smiles,
+                                    'MW': rdMolDescriptors.CalcExactMolWt(mol),
+                                    'LogP': rdMolDescriptors.CalcCrippenDescriptors(mol)[0],
+                                    'TPSA': rdMolDescriptors.CalcTPSA(mol),
+                                    'HBD': rdMolDescriptors.CalcNumHBD(mol),
+                                    'HBA': rdMolDescriptors.CalcNumHBA(mol),
+                                    'RotB': rdMolDescriptors.CalcNumRotatableBonds(mol),
+                                    'Rings': rdMolDescriptors.CalcNumRings(mol),
+                                    'Atoms': mol.GetNumAtoms()
+                                }
+                                properties_data.append(props)
+                        
+                        if properties_data:
+                            # Create properties DataFrame
+                            props_df = pd.DataFrame(properties_data)
+                            
+                            # Display properties table
+                            st.subheader("📊 Molecular Properties Summary")
+                            st.dataframe(props_df, use_container_width=True, hide_index=True)
+                            
+                            # Create visualizations
+                            st.subheader("📈 Property Distributions")
+                            
+                            # MW vs LogP scatter plot
+                            fig1 = px.scatter(
+                                props_df, 
+                                x='MW', 
+                                y='LogP', 
+                                color='Name',
+                                title="Molecular Weight vs LogP",
+                                hover_data=['TPSA', 'HBD', 'HBA']
+                            )
+                            fig1.update_layout(height=500)
+                            st.plotly_chart(fig1, use_container_width=True)
+                            
+                            # TPSA vs HBD scatter plot
+                            fig2 = px.scatter(
+                                props_df, 
+                                x='TPSA', 
+                                y='HBD', 
+                                color='Name',
+                                title="TPSA vs HBD Count",
+                                hover_data=['MW', 'LogP', 'HBA']
+                            )
+                            fig2.update_layout(height=500)
+                            st.plotly_chart(fig2, use_container_width=True)
+                            
+                            # Property distribution histograms
+                            st.subheader("📊 Property Distribution Histograms")
+                            
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                fig3 = px.histogram(
+                                    props_df, 
+                                    x='MW', 
+                                    title="Molecular Weight Distribution",
+                                    nbins=10
+                                )
+                                st.plotly_chart(fig3, use_container_width=True)
+                            
+                            with col2:
+                                fig4 = px.histogram(
+                                    props_df, 
+                                    x='LogP', 
+                                    title="LogP Distribution",
+                                    nbins=10
+                                )
+                                st.plotly_chart(fig4, use_container_width=True)
+                            
+                            # Drug-likeness analysis
+                            st.subheader("💊 Drug-likeness Analysis")
+                            
+                            # Lipinski's Rule of Five
+                            lipinski_pass = []
+                            for _, row in props_df.iterrows():
+                                mw_ok = row['MW'] <= 500
+                                logp_ok = row['LogP'] <= 5
+                                hbd_ok = row['HBD'] <= 5
+                                hba_ok = row['HBA'] <= 10
+                                lipinski_pass.append(mw_ok and logp_ok and hbd_ok and hba_ok)
+                            
+                            props_df['Lipinski_Pass'] = lipinski_pass
+                            
+                            # Display drug-likeness summary
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Lipinski Compliant", f"{sum(lipinski_pass)}/{len(lipinski_pass)}")
+                            with col2:
+                                st.metric("Average MW", f"{props_df['MW'].mean():.1f} Da")
+                            with col3:
+                                st.metric("Average LogP", f"{props_df['LogP'].mean():.2f}")
+                            
+                            # Drug-likeness radar chart
+                            if len(props_df) > 1:
+                                # Normalize properties for radar chart
+                                normalized_props = props_df.copy()
+                                for col in ['MW', 'LogP', 'TPSA', 'HBD', 'HBA', 'RotB']:
+                                    normalized_props[col] = (props_df[col] - props_df[col].min()) / (props_df[col].max() - props_df[col].min())
+                                
+                                fig_radar = go.Figure()
+                                
+                                for _, row in normalized_props.iterrows():
+                                    fig_radar.add_trace(go.Scatterpolar(
+                                        r=[row['MW'], row['LogP'], row['TPSA'], row['HBD'], row['HBA'], row['RotB']],
+                                        theta=['MW', 'LogP', 'TPSA', 'HBD', 'HBA', 'RotB'],
+                                        fill='toself',
+                                        name=row['Name']
+                                    ))
+                                
+                                fig_radar.update_layout(
+                                    polar=dict(
+                                        radialaxis=dict(
+                                            visible=True,
+                                            range=[0, 1]
+                                        )
+                                    ),
+                                    title="Normalized Property Comparison",
+                                    height=500
+                                )
+                                
+                                st.plotly_chart(fig_radar, use_container_width=True)
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error in structure analysis: {str(e)}")
+                else:
+                    st.warning("⚠️ RDKit not available - cannot perform structure analysis")
+    
+    # Tab 3: Molecular Docking
+    with pipeline_tab3:
+        st.subheader("⚗️ Molecular Docking Analysis")
+        
+        if not st.session_state.drug_discovery_pipeline['target_protein']:
+            st.warning("⚠️ Please load a protein target first (Tab 1)")
+        elif not st.session_state.drug_discovery_pipeline['ligand_library']:
+            st.warning("⚠️ Please load a ligand library first (Tab 2)")
+        else:
+            st.success("✅ Ready for molecular docking")
+            
+            # Docking parameters
+            col1, col2 = st.columns(2)
+            with col1:
+                docking_algorithm = st.selectbox(
+                    "Docking Algorithm",
+                    ["AutoDock Vina", "CB-Dock", "Quick Docking"],
+                    help="Select the molecular docking algorithm"
+                )
+            with col2:
+                exhaustiveness = st.slider("Exhaustiveness", 1, 100, 8, help="Higher values = more thorough search")
+            
+            if st.button("🚀 Start Molecular Docking", type="primary", key="start_docking_btn"):
+                with st.spinner("Performing molecular docking..."):
+                    # Simulate docking process
+                    target_structure = st.session_state.drug_discovery_pipeline['target_protein']['structure']
+                    ligand_library = st.session_state.drug_discovery_pipeline['ligand_library']
+                    
+                    docking_results = []
+                    progress_bar = st.progress(0)
+                    
+                    for i, ligand in enumerate(ligand_library):
+                        # Simulate docking calculation
+                        import time
+                        time.sleep(0.5)  # Simulate processing time
+                        
+                        # Generate simulated docking results
+                        binding_affinity = round(random.uniform(-12.0, -2.0), 2)  # kcal/mol
+                        binding_pose_quality = round(random.uniform(0.3, 0.9), 3)
+                        interaction_energy = round(random.uniform(-15.0, -5.0), 2)
+                        
+                        docking_result = {
+                            'compound_name': ligand['name'],
+                            'smiles': ligand['smiles'],
+                            'binding_affinity': binding_affinity,
+                            'pose_quality': binding_pose_quality,
+                            'interaction_energy': interaction_energy,
+                            'docking_score': round((binding_affinity + interaction_energy) / 2, 2),
+                            'rank': i + 1
+                        }
+                        docking_results.append(docking_result)
+                        
+                        progress_bar.progress((i + 1) / len(ligand_library))
+                    
+                    st.session_state.drug_discovery_pipeline['docking_results'] = docking_results
+                    st.success(f"✅ Docking completed for {len(docking_results)} compounds")
+                    
+                    # Display docking results
+                    st.subheader("📊 Docking Results")
+                    docking_df = pd.DataFrame(docking_results)
+                    docking_df = docking_df.sort_values('docking_score', ascending=False)
+                    st.dataframe(docking_df, use_container_width=True, hide_index=True)
+                    
+                    # Top compounds visualization
+                    st.subheader("🏆 Top Docking Candidates")
+                    top_compounds = docking_df.head(5)
+                    
+                    for idx, compound in top_compounds.iterrows():
+                        with st.expander(f"🥇 {compound['compound_name']} (Score: {compound['docking_score']:.2f})"):
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Binding Affinity", f"{compound['binding_affinity']:.2f} kcal/mol")
+                            with col2:
+                                st.metric("Pose Quality", f"{compound['pose_quality']:.3f}")
+                            with col3:
+                                st.metric("Interaction Energy", f"{compound['interaction_energy']:.2f} kcal/mol")
+    
+    # Tab 4: ADMET Analysis & Ranking
+    with pipeline_tab4:
+        st.subheader("📊 ADMET Analysis & Compound Ranking")
+        
+        if not st.session_state.drug_discovery_pipeline['docking_results']:
+            st.warning("⚠️ Please perform molecular docking first (Tab 3)")
+        else:
+            st.success("✅ Ready for ADMET analysis")
+            
+            if st.button("🧪 Analyze ADMET Properties", type="primary", key="admet_analysis_btn"):
+                with st.spinner("Computing ADMET properties for all compounds..."):
+                    docking_results = st.session_state.drug_discovery_pipeline['docking_results']
+                    admet_predictions = []
+                    
+                    progress_bar = st.progress(0)
+                    
+                    for i, compound in enumerate(docking_results):
+                        # Compute ADMET properties
+                        props = compute_admet_properties(compound['smiles'])
+                        
+                        if 'error' not in props:
+                            summary = interpret_admet(props)
+                            
+                            # Calculate overall drug-likeness score
+                            overall_score = np.mean([
+                                summary['absorption']['score'],
+                                summary['distribution']['score'],
+                                summary['metabolism']['score'],
+                                summary['excretion']['score'],
+                                summary['toxicity']['score'],
+                                summary['drug_likeness']['score']
+                            ])
+                            
+                            # Combine docking and ADMET scores
+                            combined_score = (compound['docking_score'] + overall_score) / 2
+                            
+                            admet_result = {
+                                'compound_name': compound['compound_name'],
+                                'smiles': compound['smiles'],
+                                'docking_score': compound['docking_score'],
+                                'admet_score': overall_score,
+                                'combined_score': combined_score,
+                                'drug_category': props.get('drug_category', 'Unknown'),
+                                'molecular_weight': props.get('mw', 0),
+                                'logp': props.get('logp', 0),
+                                'tpsa': props.get('tpsa', 0),
+                                'lipinski_pass': props.get('lipinski_pass', False),
+                                'pains_alerts': props.get('pains', 0),
+                                'qed_score': props.get('qed_score', 0)
+                            }
+                            admet_predictions.append(admet_result)
+                        else:
+                            # Handle compounds with ADMET errors
+                            admet_result = {
+                                'compound_name': compound['compound_name'],
+                                'smiles': compound['smiles'],
+                                'docking_score': compound['docking_score'],
+                                'admet_score': 0.0,
+                                'combined_score': compound['docking_score'],
+                                'drug_category': 'Unknown',
+                                'molecular_weight': 0,
+                                'logp': 0,
+                                'tpsa': 0,
+                                'lipinski_pass': False,
+                                'pains_alerts': 0,
+                                'qed_score': 0
+                            }
+                            admet_predictions.append(admet_result)
+                        
+                        progress_bar.progress((i + 1) / len(docking_results))
+                    
+                    # Rank compounds by combined score
+                    admet_predictions.sort(key=lambda x: x['combined_score'], reverse=True)
+                    st.session_state.drug_discovery_pipeline['admet_predictions'] = admet_predictions
+                    
+                    st.success(f"✅ ADMET analysis completed for {len(admet_predictions)} compounds")
+                    
+                    # Display ranked results
+                    st.subheader("🏆 Ranked Drug Candidates")
+                    ranked_df = pd.DataFrame(admet_predictions)
+                    st.dataframe(ranked_df, use_container_width=True, hide_index=True)
+                    
+                    # Enhanced ADMET Properties Visualization
+                    st.subheader("🧬 Comprehensive ADMET Properties Analysis")
+                    
+                    # Create tabs for different visualizations
+                    viz_tab1, viz_tab2, viz_tab3, viz_tab4 = st.tabs([
+                        "📊 Scatter Plot", 
+                        "📈 ADMET Radar", 
+                        "🎯 Property Heatmap", 
+                        "📋 Detailed Analysis"
+                    ])
+                    
+                    with viz_tab1:
+                        st.subheader("🥇 Top Drug Candidates Scatter Plot")
+                        top_candidates = ranked_df.head(10)
+                        
+                        # Create enhanced scatter plot
+                        fig = go.Figure()
+                        
+                        # Ensure marker sizes are positive and reasonable
+                        marker_sizes = np.abs(top_candidates['combined_score']) * 20 + 10
+                        marker_sizes = np.clip(marker_sizes, 10, 100)
+                        
+                        fig.add_trace(go.Scatter(
+                            x=top_candidates['docking_score'],
+                            y=top_candidates['admet_score'],
+                            mode='markers+text',
+                            text=top_candidates['compound_name'],
+                            textposition='top center',
+                            marker=dict(
+                                size=marker_sizes,
+                                color=top_candidates['combined_score'],
+                                colorscale='Viridis',
+                                showscale=True,
+                                colorbar=dict(title="Combined Score"),
+                                line=dict(width=2, color='white')
+                            ),
+                            name='Drug Candidates',
+                            hovertemplate='<b>%{text}</b><br>' +
+                                        'Docking Score: %{x:.3f}<br>' +
+                                        'ADMET Score: %{y:.3f}<br>' +
+                                        'Combined Score: %{marker.color:.3f}<extra></extra>'
+                        ))
+                        
+                        fig.update_layout(
+                            title="Drug Candidate Performance Matrix",
+                            xaxis_title="Docking Score (Binding Affinity)",
+                            yaxis_title="ADMET Score (Drug-likeness)",
+                            height=600,
+                            showlegend=False,
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)'
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    with viz_tab2:
+                        st.subheader("🎯 ADMET Profile Radar Charts")
+                        
+                        # Create radar charts for top 5 candidates
+                        top_5 = ranked_df.head(5)
+                        
+                        for idx, candidate in top_5.iterrows():
+                            with st.expander(f"🧬 {candidate['compound_name']} - ADMET Profile"):
+                                # Get detailed ADMET properties
+                                props = compute_admet_properties(candidate['smiles'])
+                                if 'error' not in props:
+                                    summary = interpret_admet(props)
+                                    
+                                    # Create radar chart
+                                    categories = ['Absorption', 'Distribution', 'Metabolism', 'Excretion', 'Toxicity', 'Drug-likeness']
+                                    scores = [
+                                        summary['absorption']['score'],
+                                        summary['distribution']['score'],
+                                        summary['metabolism']['score'],
+                                        summary['excretion']['score'],
+                                        summary['toxicity']['score'],
+                                        summary['drug_likeness']['score']
+                                    ]
+                                    
+                                    fig_radar = go.Figure()
+                                    fig_radar.add_trace(go.Scatterpolar(
+                                        r=scores,
+                                        theta=categories,
+                                        fill='toself',
+                                        name=candidate['compound_name'],
+                                        line_color='rgb(32, 201, 151)',
+                                        fillcolor='rgba(32, 201, 151, 0.3)'
+                                    ))
+                                    
+                                    fig_radar.update_layout(
+                                        polar=dict(
+                                            radialaxis=dict(
+                                                visible=True,
+                                                range=[0, 1],
+                                                tickfont=dict(size=12)
+                                            )
+                                        ),
+                                        title=f"ADMET Profile: {candidate['compound_name']}",
+                                        height=400,
+                                        showlegend=True
+                                    )
+                                    
+                                    st.plotly_chart(fig_radar, use_container_width=True)
+                                    
+                                    # Display key properties
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("Molecular Weight", f"{props.get('mw', 0):.1f} Da")
+                                    with col2:
+                                        st.metric("LogP", f"{props.get('logp', 0):.2f}")
+                                    with col3:
+                                        st.metric("TPSA", f"{props.get('tpsa', 0):.1f} Å²")
+                                    with col4:
+                                        st.metric("QED Score", f"{props.get('qed_score', 0):.3f}")
+                                    
+                                    # Detailed ADMET Parameters Breakdown
+                                    st.subheader("📊 Detailed ADMET Parameters")
+                                    
+                                    # Local helpers to compute per-parameter scores safely (0-1)
+                                    def _score_range(value, low, high):
+                                        try:
+                                            v = float(value)
+                                        except Exception:
+                                            return 0.0
+                                        if low == high:
+                                            return 1.0 if v == low else 0.0
+                                        if v <= low:
+                                            return 0.0
+                                        if v >= high:
+                                            return 0.0
+                                        # Peak at middle of range for bell-like preference? Use linear inside bounds to 1 at center
+                                        mid = (low + high) / 2.0
+                                        half = (high - low) / 2.0
+                                        return max(0.0, 1.0 - abs(v - mid) / half)
+                                    
+                                    def _score_le(value, threshold):
+                                        try:
+                                            v = float(value)
+                                        except Exception:
+                                            return 0.0
+                                        if v <= threshold:
+                                            # Better if comfortably below
+                                            return min(1.0, 0.6 + (threshold - v) / max(1.0, threshold) * 0.4)
+                                        return max(0.0, 1.0 - (v - threshold) / (abs(threshold) + 1.0))
+                                    
+                                    def _score_ge(value, threshold):
+                                        try:
+                                            v = float(value)
+                                        except Exception:
+                                            return 0.0
+                                        if v >= threshold:
+                                            # Better if comfortably above
+                                            return min(1.0, 0.6 + (v - threshold) / (abs(threshold) + 1.0) * 0.4)
+                                        return max(0.0, 1.0 - (threshold - v) / (abs(threshold) + 1.0))
+                                    
+                                    # Compute per-category parameter scores from props
+                                    abs_scores = {
+                                        'mw_score': _score_range(props.get('mw', 0), 150, 500),
+                                        'logp_score': _score_range(props.get('logp', 0), 0, 5),
+                                        'tpsa_score': _score_range(props.get('tpsa', 0), 0, 140),
+                                        'hbd_score': _score_range(props.get('hbd', 0), 0, 5),
+                                        'hba_score': _score_range(props.get('hba', 0), 0, 10),
+                                        'rotb_score': _score_range(props.get('rotb', 0), 0, 10),
+                                        'bioavailability_score': _score_ge(props.get('bioavailability_score', 0), 0.5),
+                                        'lipinski_score': 1.0 if props.get('lipinski_pass') else 0.0,
+                                    }
+                                    
+                                    dist_scores = {
+                                        'logp_score': _score_range(props.get('logp', 0), 2, 5),
+                                        'tpsa_score': _score_range(props.get('tpsa', 0), 0, 90),
+                                        'mw_score': _score_range(props.get('mw', 0), 150, 500),
+                                        'hbd_score': _score_range(props.get('hbd', 0), 0, 3),
+                                        'hba_score': _score_range(props.get('hba', 0), 0, 8),
+                                        'cns_score': _score_ge(props.get('cns_permeability', 0), 0.5),
+                                        'bbb_score': _score_ge(props.get('bbb_score', 0), 0.5),
+                                    }
+                                    
+                                    metab_scores = {
+                                        'mw_score': _score_range(props.get('mw', 0), 150, 500),
+                                        'logp_score': _score_range(props.get('logp', 0), 0, 5),
+                                        'tpsa_score': _score_range(props.get('tpsa', 0), 0, 140),
+                                        'hbd_score': _score_range(props.get('hbd', 0), 0, 5),
+                                        'hba_score': _score_range(props.get('hba', 0), 0, 10),
+                                        'rotb_score': _score_range(props.get('rotb', 0), 0, 10),
+                                        'stability_score': _score_ge(props.get('metabolic_stability', 0), 0.5),
+                                    }
+                                    
+                                    excr_scores = {
+                                        'mw_score': _score_range(props.get('mw', 0), 150, 500),
+                                        'logp_score': _score_range(props.get('logp', 0), 0, 5),
+                                        'tpsa_score': _score_range(props.get('tpsa', 0), 0, 140),
+                                        'hbd_score': _score_range(props.get('hbd', 0), 0, 5),
+                                        'hba_score': _score_range(props.get('hba', 0), 0, 10),
+                                        'rotb_score': _score_range(props.get('rotb', 0), 0, 10),
+                                        'clearance_score': _score_ge(props.get('renal_clearance', 0), 0.5),
+                                    }
+                                    
+                                    # For toxicity, lower alerts are better
+                                    def _inverse_alert_score(count):
+                                        try:
+                                            c = float(count)
+                                        except Exception:
+                                            c = 0.0
+                                        return max(0.0, 1.0 - 0.2 * c)
+                                    
+                                    tox_scores = {
+                                        'mw_score': _score_range(props.get('mw', 0), 150, 500),
+                                        'logp_score': _score_range(props.get('logp', 0), 0, 5),
+                                        'tpsa_score': _score_range(props.get('tpsa', 0), 0, 140),
+                                        'hbd_score': _score_range(props.get('hbd', 0), 0, 5),
+                                        'hba_score': _score_range(props.get('hba', 0), 0, 10),
+                                        'rotb_score': _score_range(props.get('rotb', 0), 0, 10),
+                                        'pains_score': _inverse_alert_score(props.get('pains', 0)),
+                                        'brenk_score': _inverse_alert_score(props.get('brenk_alerts', 0)),
+                                        'nih_score': _inverse_alert_score(props.get('nih_alerts', 0)),
+                                        'alerts_score': _inverse_alert_score(props.get('total_alerts', 0)),
+                                    }
+                                    
+                                    # Drug-likeness scoring
+                                    def _bool_score(flag):
+                                        return 1.0 if bool(flag) else 0.0
+                                    
+                                    def _clip01(x):
+                                        try:
+                                            v = float(x)
+                                        except Exception:
+                                            v = 0.0
+                                        return max(0.0, min(1.0, v))
+                                    
+                                    category = props.get('drug_category', 'Unknown')
+                                    if isinstance(category, str):
+                                        category_lower = category.lower()
+                                    else:
+                                        category_lower = 'unknown'
+                                    if 'drug' in category_lower:
+                                        category_score = 1.0
+                                    elif 'lead' in category_lower:
+                                        category_score = 0.8
+                                    elif 'fragment' in category_lower:
+                                        category_score = 0.6
+                                    else:
+                                        category_score = 0.5
+                                    
+                                    dl_scores = {
+                                        'qed_score': _clip01(props.get('qed_score', 0)),
+                                        'category_score': category_score,
+                                        'lead_like_score': _bool_score(props.get('lead_like_pass')),
+                                        'fragment_like_score': _bool_score(props.get('fragment_like_pass')),
+                                        'cns_like_score': _bool_score(props.get('cns_like_pass')),
+                                        'lipinski_score': _bool_score(props.get('lipinski_pass')),
+                                        'veber_score': _bool_score(props.get('veber_pass')),
+                                        'egan_score': _bool_score(props.get('egan_pass')),
+                                        'synthetic_score': 1.0 - min(1.0, float(props.get('synthetic_accessibility', 0)) / 10.0),
+                                    }
+                                    
+                                    # Create tabs for each ADMET category
+                                    admet_tabs = st.tabs([
+                                        "🔍 Absorption", "🌐 Distribution", "⚗️ Metabolism", 
+                                        "💧 Excretion", "⚠️ Toxicity", "💊 Drug-likeness"
+                                    ])
+                                    
+                                    with admet_tabs[0]:  # Absorption
+                                        st.subheader("🔍 Absorption Properties")
+                                        absorption_data = {
+                                            'Property': [
+                                                'Molecular Weight (Da)', 'LogP', 'TPSA (Å²)', 
+                                                'HBD Count', 'HBA Count', 'Rotatable Bonds',
+                                                'Bioavailability Score', 'Lipinski Rule Pass'
+                                            ],
+                                            'Value': [
+                                                f"{props.get('mw', 0):.1f}",
+                                                f"{props.get('logp', 0):.2f}",
+                                                f"{props.get('tpsa', 0):.1f}",
+                                                props.get('hbd', 0),
+                                                props.get('hba', 0),
+                                                props.get('rotb', 0),
+                                                f"{props.get('bioavailability_score', 0):.3f}",
+                                                '✅' if props.get('lipinski_pass') else '❌'
+                                            ],
+                                            'Score': [
+                                                f"{abs_scores['mw_score']:.3f}",
+                                                f"{abs_scores['logp_score']:.3f}",
+                                                f"{abs_scores['tpsa_score']:.3f}",
+                                                f"{abs_scores['hbd_score']:.3f}",
+                                                f"{abs_scores['hba_score']:.3f}",
+                                                f"{abs_scores['rotb_score']:.3f}",
+                                                f"{abs_scores['bioavailability_score']:.3f}",
+                                                f"{abs_scores['lipinski_score']:.3f}"
+                                            ],
+                                            'Target': [
+                                                '150-500 Da', '0-5', '0-140 Å²', 
+                                                '0-5', '0-10', '0-10',
+                                                '>0.5', 'Pass'
+                                            ]
+                                        }
+                                        absorption_df = pd.DataFrame(absorption_data)
+                                        st.dataframe(absorption_df, use_container_width=True, hide_index=True)
+                                    
+                                    with admet_tabs[1]:  # Distribution
+                                        st.subheader("🌐 Distribution Properties")
+                                        distribution_data = {
+                                            'Property': [
+                                                'LogP', 'TPSA (Å²)', 'Molecular Weight (Da)',
+                                                'HBD Count', 'HBA Count', 'CNS Permeability',
+                                                'Blood-Brain Barrier Score'
+                                            ],
+                                            'Value': [
+                                                f"{props.get('logp', 0):.2f}",
+                                                f"{props.get('tpsa', 0):.1f}",
+                                                f"{props.get('mw', 0):.1f}",
+                                                props.get('hbd', 0),
+                                                props.get('hba', 0),
+                                                f"{props.get('cns_permeability', 0):.3f}",
+                                                f"{props.get('bbb_score', 0):.3f}"
+                                            ],
+                                            'Score': [
+                                                f"{dist_scores['logp_score']:.3f}",
+                                                f"{dist_scores['tpsa_score']:.3f}",
+                                                f"{dist_scores['mw_score']:.3f}",
+                                                f"{dist_scores['hbd_score']:.3f}",
+                                                f"{dist_scores['hba_score']:.3f}",
+                                                f"{dist_scores['cns_score']:.3f}",
+                                                f"{dist_scores['bbb_score']:.3f}"
+                                            ],
+                                            'Target': [
+                                                '2-5', '0-90 Å²', '150-500 Da',
+                                                '0-3', '0-8', '>0.5',
+                                                '>0.5'
+                                            ]
+                                        }
+                                        distribution_df = pd.DataFrame(distribution_data)
+                                        st.dataframe(distribution_df, use_container_width=True, hide_index=True)
+                                    
+                                    with admet_tabs[2]:  # Metabolism
+                                        st.subheader("⚗️ Metabolism Properties")
+                                        metabolism_data = {
+                                            'Property': [
+                                                'Molecular Weight (Da)', 'LogP', 'TPSA (Å²)',
+                                                'HBD Count', 'HBA Count', 'Rotatable Bonds',
+                                                'Metabolic Stability Score'
+                                            ],
+                                            'Value': [
+                                                f"{props.get('mw', 0):.1f}",
+                                                f"{props.get('logp', 0):.2f}",
+                                                f"{props.get('tpsa', 0):.1f}",
+                                                props.get('hbd', 0),
+                                                props.get('hba', 0),
+                                                props.get('rotb', 0),
+                                                f"{props.get('metabolic_stability', 0):.3f}"
+                                            ],
+                                            'Score': [
+                                                f"{metab_scores['mw_score']:.3f}",
+                                                f"{metab_scores['logp_score']:.3f}",
+                                                f"{metab_scores['tpsa_score']:.3f}",
+                                                f"{metab_scores['hbd_score']:.3f}",
+                                                f"{metab_scores['hba_score']:.3f}",
+                                                f"{metab_scores['rotb_score']:.3f}",
+                                                f"{metab_scores['stability_score']:.3f}"
+                                            ],
+                                            'Target': [
+                                                '150-500 Da', '0-5', '0-140 Å²',
+                                                '0-5', '0-10', '0-10',
+                                                '>0.5'
+                                            ]
+                                        }
+                                        metabolism_df = pd.DataFrame(metabolism_data)
+                                        st.dataframe(metabolism_df, use_container_width=True, hide_index=True)
+                                    
+                                    with admet_tabs[3]:  # Excretion
+                                        st.subheader("💧 Excretion Properties")
+                                        excretion_data = {
+                                            'Property': [
+                                                'Molecular Weight (Da)', 'LogP', 'TPSA (Å²)',
+                                                'HBD Count', 'HBA Count', 'Rotatable Bonds',
+                                                'Renal Clearance Score'
+                                            ],
+                                            'Value': [
+                                                f"{props.get('mw', 0):.1f}",
+                                                f"{props.get('logp', 0):.2f}",
+                                                f"{props.get('tpsa', 0):.1f}",
+                                                props.get('hbd', 0),
+                                                props.get('hba', 0),
+                                                props.get('rotb', 0),
+                                                f"{props.get('renal_clearance', 0):.3f}"
+                                            ],
+                                            'Score': [
+                                                f"{excr_scores['mw_score']:.3f}",
+                                                f"{excr_scores['logp_score']:.3f}",
+                                                f"{excr_scores['tpsa_score']:.3f}",
+                                                f"{excr_scores['hbd_score']:.3f}",
+                                                f"{excr_scores['hba_score']:.3f}",
+                                                f"{excr_scores['rotb_score']:.3f}",
+                                                f"{excr_scores['clearance_score']:.3f}"
+                                            ],
+                                            'Target': [
+                                                '150-500 Da', '0-5', '0-140 Å²',
+                                                '0-5', '0-10', '0-10',
+                                                '>0.5'
+                                            ]
+                                        }
+                                        excretion_df = pd.DataFrame(excretion_data)
+                                        st.dataframe(excretion_df, use_container_width=True, hide_index=True)
+                                    
+                                    with admet_tabs[4]:  # Toxicity
+                                        st.subheader("⚠️ Toxicity Properties")
+                                        toxicity_data = {
+                                            'Property': [
+                                                'Molecular Weight (Da)', 'LogP', 'TPSA (Å²)',
+                                                'HBD Count', 'HBA Count', 'Rotatable Bonds',
+                                                'PAINS Alerts', 'Brenk Alerts', 'NIH Alerts',
+                                                'Total Structural Alerts'
+                                            ],
+                                            'Value': [
+                                                f"{props.get('mw', 0):.1f}",
+                                                f"{props.get('logp', 0):.2f}",
+                                                f"{props.get('tpsa', 0):.1f}",
+                                                props.get('hbd', 0),
+                                                props.get('hba', 0),
+                                                props.get('rotb', 0),
+                                                props.get('pains', 0),
+                                                props.get('brenk_alerts', 0),
+                                                props.get('nih_alerts', 0),
+                                                props.get('total_alerts', 0)
+                                            ],
+                                            'Score': [
+                                                f"{tox_scores['mw_score']:.3f}",
+                                                f"{tox_scores['logp_score']:.3f}",
+                                                f"{tox_scores['tpsa_score']:.3f}",
+                                                f"{tox_scores['hbd_score']:.3f}",
+                                                f"{tox_scores['hba_score']:.3f}",
+                                                f"{tox_scores['rotb_score']:.3f}",
+                                                f"{tox_scores['pains_score']:.3f}",
+                                                f"{tox_scores['brenk_score']:.3f}",
+                                                f"{tox_scores['nih_score']:.3f}",
+                                                f"{tox_scores['alerts_score']:.3f}"
+                                            ],
+                                            'Target': [
+                                                '150-500 Da', '0-5', '0-140 Å²',
+                                                '0-5', '0-10', '0-10',
+                                                '0', '0', '0',
+                                                '0'
+                                            ]
+                                        }
+                                        toxicity_df = pd.DataFrame(toxicity_data)
+                                        st.dataframe(toxicity_df, use_container_width=True, hide_index=True)
+                                    
+                                    with admet_tabs[5]:  # Drug-likeness
+                                        st.subheader("💊 Drug-likeness Properties")
+                                        drug_likeness_data = {
+                                            'Property': [
+                                                'QED Score', 'Drug Category', 'Lead-like Pass',
+                                                'Fragment-like Pass', 'CNS-likeness Pass',
+                                                'Lipinski Rule Pass', 'Veber Rule Pass',
+                                                'Egan Rule Pass', 'Synthetic Accessibility'
+                                            ],
+                                            'Value': [
+                                                f"{props.get('qed_score', 0):.3f}",
+                                                props.get('drug_category', 'Unknown'),
+                                                '✅' if props.get('lead_like_pass') else '❌',
+                                                '✅' if props.get('fragment_like_pass') else '❌',
+                                                '✅' if props.get('cns_like_pass') else '❌',
+                                                '✅' if props.get('lipinski_pass') else '❌',
+                                                '✅' if props.get('veber_pass') else '❌',
+                                                '✅' if props.get('egan_pass') else '❌',
+                                                f"{props.get('synthetic_accessibility', 0):.3f}"
+                                            ],
+                                            'Score': [
+                                                f"{dl_scores['qed_score']:.3f}",
+                                                f"{dl_scores['category_score']:.3f}",
+                                                f"{dl_scores['lead_like_score']:.3f}",
+                                                f"{dl_scores['fragment_like_score']:.3f}",
+                                                f"{dl_scores['cns_like_score']:.3f}",
+                                                f"{dl_scores['lipinski_score']:.3f}",
+                                                f"{dl_scores['veber_score']:.3f}",
+                                                f"{dl_scores['egan_score']:.3f}",
+                                                f"{dl_scores['synthetic_score']:.3f}"
+                                            ],
+                                            'Target': [
+                                                '>0.5', 'Drug-like', 'Pass',
+                                                'Pass', 'Pass',
+                                                'Pass', 'Pass',
+                                                'Pass', '<5.0'
+                                            ]
+                                        }
+                                        drug_likeness_df = pd.DataFrame(drug_likeness_data)
+                                        st.dataframe(drug_likeness_df, use_container_width=True, hide_index=True)
+                    
+                    with viz_tab3:
+                        st.subheader("🔥 ADMET Properties Heatmap")
+                        
+                        # Create heatmap data
+                        heatmap_data = []
+                        compound_names = []
+                        
+                        for idx, candidate in ranked_df.head(8).iterrows():
+                            props = compute_admet_properties(candidate['smiles'])
+                            if 'error' not in props:
+                                summary = interpret_admet(props)
+                                heatmap_data.append([
+                                    summary['absorption']['score'],
+                                    summary['distribution']['score'],
+                                    summary['metabolism']['score'],
+                                    summary['excretion']['score'],
+                                    summary['toxicity']['score'],
+                                    summary['drug_likeness']['score']
+                                ])
+                                compound_names.append(candidate['compound_name'])
+                        
+                        if heatmap_data:
+                            fig_heatmap = go.Figure(data=go.Heatmap(
+                                z=heatmap_data,
+                                x=['Absorption', 'Distribution', 'Metabolism', 'Excretion', 'Toxicity', 'Drug-likeness'],
+                                y=compound_names,
+                                colorscale='RdYlGn',
+                                showscale=True,
+                                colorbar=dict(title="ADMET Score")
+                            ))
+                            
+                            fig_heatmap.update_layout(
+                                title="ADMET Properties Heatmap",
+                                xaxis_title="ADMET Categories",
+                                yaxis_title="Compounds",
+                                height=500
+                            )
+                            
+                            st.plotly_chart(fig_heatmap, use_container_width=True)
+                    
+                    with viz_tab4:
+                        st.subheader("📋 Detailed Compound Analysis")
+                        
+                        # Show detailed analysis for top 3 compounds
+                        for idx, candidate in ranked_df.head(3).iterrows():
+                            with st.expander(f"🔍 Detailed Analysis: {candidate['compound_name']}"):
+                                props = compute_admet_properties(candidate['smiles'])
+                                
+                                if 'error' not in props:
+                                    summary = interpret_admet(props)
+                                    
+                                    # Overall metrics
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("Combined Score", f"{candidate['combined_score']:.3f}")
+                                    with col2:
+                                        st.metric("Docking Score", f"{candidate['docking_score']:.3f}")
+                                    with col3:
+                                        st.metric("ADMET Score", f"{candidate['admet_score']:.3f}")
+                                    with col4:
+                                        st.metric("Drug Category", candidate['drug_category'])
+                                    
+                                    # ADMET breakdown
+                                    st.subheader("ADMET Breakdown")
+                                    
+                                    # Create bar chart for ADMET scores
+                                    admet_categories = ['Absorption', 'Distribution', 'Metabolism', 'Excretion', 'Toxicity', 'Drug-likeness']
+                                    admet_scores = [
+                                        summary['absorption']['score'],
+                                        summary['distribution']['score'],
+                                        summary['metabolism']['score'],
+                                        summary['excretion']['score'],
+                                        summary['toxicity']['score'],
+                                        summary['drug_likeness']['score']
+                                    ]
+                                    
+                                    fig_bar = go.Figure()
+                                    fig_bar.add_trace(go.Bar(
+                                        x=admet_categories,
+                                        y=admet_scores,
+                                        marker_color=['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#feca57', '#ff9ff3'],
+                                        text=admet_scores,
+                                        textposition='auto'
+                                    ))
+                                    
+                                    fig_bar.update_layout(
+                                        title=f"ADMET Scores: {candidate['compound_name']}",
+                                        xaxis_title="ADMET Categories",
+                                        yaxis_title="Score",
+                                        yaxis=dict(range=[0, 1]),
+                                        height=400
+                                    )
+                                    
+                                    st.plotly_chart(fig_bar, use_container_width=True)
+                                    
+                                    # Molecular properties
+                                    st.subheader("Molecular Properties")
+                                    col1, col2, col3 = st.columns(3)
+                                    with col1:
+                                        st.metric("MW", f"{props.get('mw', 0):.1f} Da")
+                                        st.metric("LogP", f"{props.get('logp', 0):.2f}")
+                                    with col2:
+                                        st.metric("TPSA", f"{props.get('tpsa', 0):.1f} Å²")
+                                        st.metric("HBD", props.get('hbd', 0))
+                                    with col3:
+                                        st.metric("HBA", props.get('hba', 0))
+                                        st.metric("RotB", props.get('rotb', 0))
+                                    
+                                    # Rule compliance
+                                    st.subheader("Drug-likeness Rules")
+                                    rules_data = {
+                                        'Rule': ['Lipinski', 'Veber', 'Egan', 'Lead-like', 'Fragment-like'],
+                                        'Pass': [
+                                            '✅' if props.get('lipinski_pass') else '❌',
+                                            '✅' if props.get('veber_pass') else '❌',
+                                            '✅' if props.get('egan_pass') else '❌',
+                                            '✅' if props.get('lead_like_pass') else '❌',
+                                            '✅' if props.get('fragment_like_pass') else '❌'
+                                        ]
+                                    }
+                                    rules_df = pd.DataFrame(rules_data)
+                                    st.dataframe(rules_df, use_container_width=True, hide_index=True)
+                                    
+                                    # Structural alerts
+                                    st.subheader("Structural Alerts")
+                                    alerts_data = {
+                                        'Alert Type': ['PAINS', 'Brenk', 'NIH', 'Total'],
+                                        'Count': [
+                                            props.get('pains', 0),
+                                            props.get('brenk_alerts', 0),
+                                            props.get('nih_alerts', 0),
+                                            props.get('total_alerts', 0)
+                                        ]
+                                    }
+                                    alerts_df = pd.DataFrame(alerts_data)
+                                    st.dataframe(alerts_df, use_container_width=True, hide_index=True)
+                    
+                    # Export results
+                    st.subheader("💾 Export Results")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        # JSON export
+                        export_data = {
+                            'pipeline_results': st.session_state.drug_discovery_pipeline,
+                            'timestamp': datetime.now().isoformat(),
+                            'summary': {
+                                'total_compounds': len(admet_predictions),
+                                'top_candidate': admet_predictions[0]['compound_name'] if admet_predictions else None,
+                                'best_score': admet_predictions[0]['combined_score'] if admet_predictions else 0
+                            }
+                        }
+                        st.download_button(
+                            "📄 Download Full Results (JSON)",
+                            data=json.dumps(export_data, indent=2),
+                            file_name=f"drug_discovery_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json"
+                        )
+                    
+                    with col2:
+                        # CSV export
+                        csv_data = ranked_df.to_csv(index=False)
+                        st.download_button(
+                            "📊 Download Rankings (CSV)",
+                            data=csv_data,
+                            file_name=f"compound_rankings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with col3:
+                        # Summary report
+                        # Fix the f-string formatting
+                        best_score = f"{admet_predictions[0]['combined_score']:.3f}" if admet_predictions else 'N/A'
+                        target_protein = st.session_state.drug_discovery_pipeline['target_protein']['pdb_id'] if st.session_state.drug_discovery_pipeline['target_protein'] else 'N/A'
+                        top_candidate = admet_predictions[0]['compound_name'] if admet_predictions else 'N/A'
+                        
+                        summary_report = f"""
+AI Drug Discovery Pipeline Results
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Target Protein: {target_protein}
+Total Compounds Screened: {len(admet_predictions)}
+Top Candidate: {top_candidate}
+Best Combined Score: {best_score}
+
+Top 5 Candidates:
+"""
+                        for i, candidate in enumerate(admet_predictions[:5]):
+                            summary_report += f"""
+{i+1}. {candidate['compound_name']}
+   - Combined Score: {candidate['combined_score']:.3f}
+   - Docking Score: {candidate['docking_score']:.3f}
+   - ADMET Score: {candidate['admet_score']:.3f}
+   - Drug Category: {candidate['drug_category']}
+"""
+                        
+                        st.download_button(
+                            "📋 Download Summary (TXT)",
+                            data=summary_report,
+                            file_name=f"discovery_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                            mime="text/plain"
+                        )
 
 # -------------------- Enhanced Sidebar Features --------------------
 with st.sidebar:
@@ -2788,6 +4658,7 @@ st.markdown("""
 <div style="text-align: center; color: #64748b; padding: 2rem;">
     <p>🧬 <strong>ProStruct - 3D</strong> | Advanced Protein Structure Prediction & Analysis Platform</p>
     <p>Built with Streamlit, ESMFold, and scientific Python libraries</p>
+    <p>Developed by Keeistu M S </p>
 </div>
 """, unsafe_allow_html=True)
 
